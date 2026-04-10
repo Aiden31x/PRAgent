@@ -18,12 +18,11 @@ logger = logging.getLogger(__name__)
 
 # Substrings that a tool name must match (case-insensitive) to be included.
 # Covers: pull_request_read, list_pull_requests, add_comment_to_pending_review,
-# pull_request_review_write, get_file_contents, get_repository_tree,
-# search_code, issue_write, issue_read, etc.
+# pull_request_review_write, get_file_contents, search_code, issue_write,
+# issue_read, etc.
 ALLOWED_TOOL_FRAGMENTS = (
     "pull_request",
     "get_file_contents",
-    "get_repository_tree",
     "search_code",
     "add_comment",
     "issue",

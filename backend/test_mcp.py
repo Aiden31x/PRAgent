@@ -5,21 +5,41 @@ calls pull_request_read on a real public PR, and prints the raw response.
 
 Prerequisites:
   - Docker running
-  - GITHUB_TOKEN set in .env (needs 'repo' scope, or fine-grained with read on public repos)
+  - GITHUB_TOKEN set in .env (needs 'repo' scope for private repos you own)
+
+Environment (optional — test your own PR):
+  MCP_TEST_REPO_FULL_NAME   e.g. your-username/your-repo (default: fastapi/fastapi)
+  MCP_TEST_PR_NUMBER        integer PR number (default: 1)
 
 Usage:
   cd backend
-  venv/bin/python test_mcp.py
+  python test_mcp.py
 """
 
 import asyncio
 import json
 import os
 import sys
+from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
+
+def _parse_target() -> tuple[str, str, int]:
+    full = os.environ.get("MCP_TEST_REPO_FULL_NAME", "fastapi/fastapi").strip()
+    if "/" not in full:
+        print("ERROR: MCP_TEST_REPO_FULL_NAME must be 'owner/repo'")
+        sys.exit(1)
+    owner, repo = full.split("/", 1)
+    raw = os.environ.get("MCP_TEST_PR_NUMBER", "1").strip()
+    try:
+        pr_number = int(raw)
+    except ValueError:
+        print("ERROR: MCP_TEST_PR_NUMBER must be an integer")
+        sys.exit(1)
+    return owner, repo, pr_number
 
 
 async def main() -> None:
@@ -30,6 +50,9 @@ async def main() -> None:
     if not token:
         print("ERROR: GITHUB_TOKEN not set in .env — grab one from https://github.com/settings/tokens")
         sys.exit(1)
+
+    owner, repo, pr_number = _parse_target()
+    print(f"Target PR: {owner}/{repo}#{pr_number}\n")
 
     print("Starting GitHub MCP server via Docker …")
     print("(First run will pull the image — this can take a minute)\n")
@@ -68,8 +91,7 @@ async def main() -> None:
                             req = " (required)" if pname in required else ""
                             print(f"  {pname}: {pinfo.get('type', '?')}{req} — {pinfo.get('description', '')}")
 
-            # ---- Fetch a real public PR ----
-            owner, repo, pr_number = "fastapi", "fastapi", 1
+            # ---- Fetch a real PR (public or one your token can access) ----
             print(f"\n{'=' * 60}")
             print(f"Calling pull_request_read method=get ({owner}/{repo}#{pr_number})")
             print("=" * 60)

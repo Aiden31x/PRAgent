@@ -53,6 +53,7 @@ class Settings(BaseSettings):
 
     # --- Gemini ---
     gemini_api_key: str = ""
+    gemini_model: str = "gemini-2.5-flash"
 
     # --- JWT ---
     jwt_secret: str = "change-me-in-production"
