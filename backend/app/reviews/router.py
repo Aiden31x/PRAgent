@@ -10,7 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.agent.orchestrator import run_review
+from app.agent.orchestrator import post_review_to_github, run_review
 from app.auth.dependencies import get_current_user
 from app.database import get_db
 from app.models import Repo, Review, ReviewComment, ReviewStatus, User
@@ -61,6 +61,7 @@ class ReviewDetailResponse(BaseModel):
     critical_count: int
     warning_count: int
     info_count: int
+    github_review_posted: bool
     comments: list[ReviewCommentResponse]
 
 
@@ -158,6 +159,49 @@ async def get_review(
     return _review_to_response(review)
 
 
+@router.post("/{review_id}/post-to-github")
+async def post_to_github(
+    review_id: int,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, str]:
+    """Manually trigger posting a completed review to GitHub.
+
+    Useful for retrying a failed post without re-running the agent.
+    """
+    stmt = (
+        select(Review)
+        .join(Repo)
+        .where(Review.id == review_id, Repo.user_id == user.id)
+        .options(selectinload(Review.comments), selectinload(Review.repo))
+    )
+    result = await db.execute(stmt)
+    review = result.scalar_one_or_none()
+
+    if review is None:
+        raise HTTPException(status_code=404, detail="Review not found")
+
+    if review.status != ReviewStatus.COMPLETED:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Review is {review.status.value}, not completed",
+        )
+
+    if not review.comments:
+        raise HTTPException(status_code=400, detail="No comments to post")
+
+    await post_review_to_github(
+        review_id=review.id,
+        repo_full_name=review.repo.full_name,
+        pr_number=review.pr_number,
+        comments=list(review.comments),
+        github_token=user.github_token,
+        db=db,
+    )
+
+    return {"status": "posted", "review_id": str(review.id)}
+
+
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
@@ -174,6 +218,7 @@ def _review_to_response(review: Review) -> ReviewDetailResponse:
         critical_count=review.critical_count,
         warning_count=review.warning_count,
         info_count=review.info_count,
+        github_review_posted=review.github_review_posted,
         comments=[
             ReviewCommentResponse(
                 id=c.id,

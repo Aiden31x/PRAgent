@@ -1,4 +1,4 @@
-"""Repo management — add repos, list repos, list open PRs."""
+"""Repo management — add repos, list repos, list open PRs, webhook lifecycle."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.dependencies import get_current_user
+from app.config import settings
 from app.database import get_db
 from app.models import Repo, User
 
@@ -57,13 +58,9 @@ async def add_repo(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> RepoResponse:
-    """Register a GitHub repo for the current user.
-
-    Validates the repo exists and the user has access via their GitHub token.
-    """
+    """Register a GitHub repo and create a webhook for automatic PR reviews."""
     owner, repo_name = _split_full_name(body.full_name)
 
-    # Verify the repo exists and user has access
     async with httpx.AsyncClient() as client:
         resp = await client.get(
             f"{GITHUB_API}/repos/{owner}/{repo_name}",
@@ -75,7 +72,6 @@ async def add_repo(
     if resp.status_code != 200:
         raise HTTPException(status_code=502, detail=f"GitHub API error: {resp.status_code}")
 
-    # Check if already added
     stmt = select(Repo).where(Repo.user_id == user.id, Repo.full_name == body.full_name)
     result = await db.execute(stmt)
     existing = result.scalar_one_or_none()
@@ -87,7 +83,15 @@ async def add_repo(
     db.add(repo)
     await db.flush()
 
-    logger.info("User %s added repo %s (id=%d)", user.github_username, body.full_name, repo.id)
+    webhook_id = await _create_github_webhook(owner, repo_name, user.github_token)
+    if webhook_id:
+        repo.webhook_id = webhook_id
+        await db.flush()
+
+    logger.info(
+        "User %s added repo %s (id=%d, webhook=%s)",
+        user.github_username, body.full_name, repo.id, webhook_id,
+    )
     return RepoResponse(id=repo.id, full_name=repo.full_name, webhook_id=repo.webhook_id)
 
 
@@ -153,6 +157,28 @@ async def list_open_prs(
     return summaries
 
 
+@router.delete("/{repo_id}")
+async def delete_repo(
+    repo_id: int,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, str]:
+    """Unregister a repo — removes the GitHub webhook and deletes the row."""
+    repo = await db.get(Repo, repo_id)
+    if repo is None or repo.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Repo not found")
+
+    if repo.webhook_id:
+        owner, repo_name = _split_full_name(repo.full_name)
+        await _delete_github_webhook(owner, repo_name, repo.webhook_id, user.github_token)
+
+    await db.delete(repo)
+    await db.flush()
+
+    logger.info("User %s deleted repo %s (id=%d)", user.github_username, repo.full_name, repo_id)
+    return {"status": "deleted", "repo_id": str(repo_id)}
+
+
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
@@ -171,3 +197,56 @@ def _gh_headers(token: str) -> dict[str, str]:
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
+
+
+async def _create_github_webhook(owner: str, repo_name: str, token: str) -> int | None:
+    """Register a webhook on GitHub and return its ID, or None on failure."""
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{GITHUB_API}/repos/{owner}/{repo_name}/hooks",
+                headers=_gh_headers(token),
+                json={
+                    "name": "web",
+                    "active": True,
+                    "events": ["pull_request"],
+                    "config": {
+                        "url": settings.webhook_url,
+                        "content_type": "json",
+                        "secret": settings.webhook_secret,
+                        "insecure_ssl": "0",
+                    },
+                },
+            )
+        if resp.status_code in (201, 200):
+            hook_id = resp.json().get("id")
+            logger.info("Created GitHub webhook %s for %s/%s", hook_id, owner, repo_name)
+            return hook_id
+        logger.warning(
+            "Failed to create webhook for %s/%s: %d %s",
+            owner, repo_name, resp.status_code, resp.text[:300],
+        )
+    except Exception:
+        logger.exception("Error creating webhook for %s/%s", owner, repo_name)
+    return None
+
+
+async def _delete_github_webhook(
+    owner: str, repo_name: str, webhook_id: int, token: str
+) -> None:
+    """Remove a webhook from GitHub. Best-effort — logs but doesn't raise."""
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.delete(
+                f"{GITHUB_API}/repos/{owner}/{repo_name}/hooks/{webhook_id}",
+                headers=_gh_headers(token),
+            )
+        if resp.status_code == 204:
+            logger.info("Deleted GitHub webhook %d for %s/%s", webhook_id, owner, repo_name)
+        else:
+            logger.warning(
+                "Failed to delete webhook %d for %s/%s: %d",
+                webhook_id, owner, repo_name, resp.status_code,
+            )
+    except Exception:
+        logger.exception("Error deleting webhook %d for %s/%s", webhook_id, owner, repo_name)

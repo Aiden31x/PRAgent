@@ -11,6 +11,7 @@ from app.database import engine, Base, get_db
 from app.auth.router import router as auth_router, _create_jwt
 from app.repos.router import router as repos_router
 from app.reviews.router import router as reviews_router
+from app.webhooks.router import router as webhooks_router
 from app.models import User
 
 
@@ -41,6 +42,7 @@ app.add_middleware(
 app.include_router(auth_router)
 app.include_router(repos_router)
 app.include_router(reviews_router)
+app.include_router(webhooks_router)
 
 
 @app.get("/health")

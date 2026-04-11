@@ -32,6 +32,7 @@ from app.models import (
     Review,
     ReviewComment,
     ReviewStatus,
+    Severity,
 )
 
 logger = logging.getLogger(__name__)
@@ -270,6 +271,24 @@ async def run_review(
                 review_output.stats.warning,
                 review_output.stats.info,
             )
+
+            # ---- 4. POST TO GITHUB (best-effort) --------------------
+            try:
+                saved_comments = await _load_review_comments(db, review_id)
+                if saved_comments:
+                    await post_review_to_github(
+                        review_id=review_id,
+                        repo_full_name=repo_full_name,
+                        pr_number=pr_number,
+                        comments=saved_comments,
+                        github_token=github_token,
+                        db=db,
+                    )
+            except Exception:
+                logger.exception(
+                    "[review=%d] GitHub posting failed — findings are saved in DB",
+                    review_id,
+                )
         else:
             logger.error("[review=%d] No valid review output produced", review_id)
             await _update_review_status(db, review_id, ReviewStatus.FAILED)
@@ -412,6 +431,18 @@ async def _update_review_status(
         await db.commit()
 
 
+async def _load_review_comments(
+    db: AsyncSession, review_id: int
+) -> list[ReviewComment]:
+    """Load all ReviewComment rows for a given review."""
+    from sqlalchemy import select
+
+    result = await db.execute(
+        select(ReviewComment).where(ReviewComment.review_id == review_id)
+    )
+    return list(result.scalars().all())
+
+
 async def _log_agent_event(
     db: AsyncSession,
     review_id: int,
@@ -449,3 +480,173 @@ async def _save_review_results(
         db.add(comment)
 
     await db.commit()
+
+
+# ------------------------------------------------------------------
+# Phase 3a — Post review to GitHub via MCP
+# ------------------------------------------------------------------
+
+
+async def post_review_to_github(
+    *,
+    review_id: int,
+    repo_full_name: str,
+    pr_number: int,
+    comments: list[ReviewComment],
+    github_token: str,
+    db: AsyncSession,
+) -> None:
+    """Post saved review findings to GitHub as a PR review with inline comments.
+
+    Creates a pending review, attaches inline comments for findings that have
+    valid file_path + line_number, submits the review, and opens GitHub issues
+    for critical findings. Failures here never fail the overall review — the
+    findings are already persisted in the DB.
+    """
+    owner, repo = repo_full_name.split("/", 1)
+    client = MCPClientManager()
+
+    critical = [c for c in comments if c.severity == Severity.CRITICAL]
+    warnings = [c for c in comments if c.severity == Severity.WARNING]
+    infos = [c for c in comments if c.severity == Severity.INFO]
+
+    review_body = (
+        f"**PRAgent automated review** — "
+        f"{len(critical)} critical, {len(warnings)} warnings, {len(infos)} info"
+    )
+
+    try:
+        await client.connect(github_token)
+        await _log_agent_event(db, review_id, AgentEventType.POSTING, "Posting review to GitHub")
+
+        # -- Step 1: Create a pending review on the PR ------------------
+        try:
+            await client.call_tool(
+                "pull_request_review_write",
+                {
+                    "owner": owner,
+                    "repo": repo,
+                    "pullNumber": pr_number,
+                    "method": "create",
+                    "body": review_body,
+                },
+            )
+            logger.info("[review=%d] Created pending GitHub review", review_id)
+        except Exception:
+            logger.exception("[review=%d] Failed to create pending review", review_id)
+
+        # -- Step 2: Add inline comments for each finding ---------------
+        posted_count = 0
+        for c in comments:
+            if not c.file_path or not c.line_number:
+                continue
+
+            body_parts = [f"**[{c.severity.value.upper()}] {c.category.value.replace('_', ' ').title()}**\n"]
+            body_parts.append(c.body)
+            if c.fix_suggestion:
+                body_parts.append(f"\n💡 **Suggested fix:**\n{c.fix_suggestion}")
+            comment_body = "\n".join(body_parts)
+
+            try:
+                await client.call_tool(
+                    "add_comment_to_pending_review",
+                    {
+                        "owner": owner,
+                        "repo": repo,
+                        "pullNumber": pr_number,
+                        "path": c.file_path,
+                        "line": c.line_number,
+                        "body": comment_body,
+                        "subjectType": "line",
+                    },
+                )
+                posted_count += 1
+            except Exception:
+                logger.warning(
+                    "[review=%d] Failed to post inline comment on %s:%d — skipping",
+                    review_id, c.file_path, c.line_number,
+                    exc_info=True,
+                )
+
+        logger.info("[review=%d] Posted %d/%d inline comments", review_id, posted_count, len(comments))
+
+        # -- Step 3: Submit the review ----------------------------------
+        submit_event = "REQUEST_CHANGES" if critical else "COMMENT"
+        try:
+            await client.call_tool(
+                "pull_request_review_write",
+                {
+                    "owner": owner,
+                    "repo": repo,
+                    "pullNumber": pr_number,
+                    "method": "submit",
+                    "event": submit_event,
+                    "body": review_body,
+                },
+            )
+            logger.info("[review=%d] Submitted review with event=%s", review_id, submit_event)
+        except Exception:
+            logger.exception("[review=%d] Failed to submit review — trying COMMENT fallback", review_id)
+            try:
+                await client.call_tool(
+                    "pull_request_review_write",
+                    {
+                        "owner": owner,
+                        "repo": repo,
+                        "pullNumber": pr_number,
+                        "method": "submit",
+                        "event": "COMMENT",
+                        "body": review_body,
+                    },
+                )
+            except Exception:
+                logger.exception("[review=%d] Fallback submit also failed", review_id)
+
+        # -- Step 4: Open issues for critical findings ------------------
+        for c in critical:
+            issue_title = f"PRAgent: {c.category.value.replace('_', ' ').title()} issue in {c.file_path}"
+            issue_body = (
+                f"**Severity:** {c.severity.value}\n"
+                f"**File:** `{c.file_path}` (line {c.line_number})\n"
+                f"**PR:** #{pr_number}\n\n"
+                f"### Description\n{c.body}\n"
+            )
+            if c.fix_suggestion:
+                issue_body += f"\n### Suggested Fix\n{c.fix_suggestion}\n"
+
+            try:
+                await client.call_tool(
+                    "issue_write",
+                    {
+                        "owner": owner,
+                        "repo": repo,
+                        "method": "create",
+                        "title": issue_title,
+                        "body": issue_body,
+                        "labels": ["bug", "pr-agent"],
+                    },
+                )
+                logger.info("[review=%d] Opened issue for critical finding in %s", review_id, c.file_path)
+            except Exception:
+                logger.warning(
+                    "[review=%d] Failed to open issue for %s — skipping",
+                    review_id, c.file_path,
+                    exc_info=True,
+                )
+
+        # -- Step 5: Mark as posted in DB -------------------------------
+        review = await db.get(Review, review_id)
+        if review:
+            review.github_review_posted = True
+            await db.commit()
+
+        await _log_agent_event(db, review_id, AgentEventType.DONE, "Posted review to GitHub")
+
+    except Exception:
+        logger.exception("[review=%d] post_review_to_github failed", review_id)
+
+    finally:
+        if client.is_connected:
+            await client.disconnect()
+
+

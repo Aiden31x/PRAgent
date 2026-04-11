@@ -2,6 +2,7 @@ import enum
 from datetime import datetime
 
 from sqlalchemy import (
+    Boolean,
     DateTime,
     Enum,
     ForeignKey,
@@ -95,6 +96,7 @@ class Review(Base):
     critical_count: Mapped[int] = mapped_column(Integer, default=0)
     warning_count: Mapped[int] = mapped_column(Integer, default=0)
     info_count: Mapped[int] = mapped_column(Integer, default=0)
+    github_review_posted: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

@@ -60,6 +60,10 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 60 * 24 * 7  # 1 week
 
+    # --- Webhooks ---
+    webhook_secret: str = "change-me-webhook-secret"
+    webhook_url: str = "http://localhost:8000/webhooks/github"
+
     # --- CORS ---
     frontend_url: str = "http://localhost:3000"
 
