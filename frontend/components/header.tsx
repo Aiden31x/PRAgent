@@ -3,9 +3,15 @@
 import { useTheme } from "next-themes";
 import { Sun, Moon, LogOut } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { clearToken } from "@/lib/auth";
 
 export function Header({ title }: { title: string }) {
   const { theme, setTheme } = useTheme();
+
+  function handleSignOut() {
+    clearToken();
+    window.location.href = "/";
+  }
 
   return (
     <header className="flex items-center justify-between border-b border-zinc-200 px-8 py-5 dark:border-zinc-800">
@@ -37,6 +43,7 @@ export function Header({ title }: { title: string }) {
         </button>
         <div className="mx-1 h-5 w-px bg-zinc-200 dark:bg-zinc-700" />
         <button
+          onClick={handleSignOut}
           className="rounded-lg p-2 text-zinc-400 transition-colors hover:bg-zinc-100 hover:text-zinc-600 dark:hover:bg-zinc-800 dark:hover:text-zinc-200"
           title="Sign out"
         >

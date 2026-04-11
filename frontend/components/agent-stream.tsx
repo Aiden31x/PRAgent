@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef } from "react";
 import {
   Brain,
   Download,
@@ -32,31 +32,14 @@ interface AgentStreamProps {
 
 export function AgentStream({ logs, isLive }: AgentStreamProps) {
   const endRef = useRef<HTMLDivElement>(null);
-  const [visibleCount, setVisibleCount] = useState(isLive ? 0 : logs.length);
-
-  useEffect(() => {
-    if (!isLive) {
-      setVisibleCount(logs.length);
-      return;
-    }
-    if (visibleCount < logs.length) {
-      const timer = setTimeout(
-        () => setVisibleCount((c) => c + 1),
-        800 + Math.random() * 1200
-      );
-      return () => clearTimeout(timer);
-    }
-  }, [visibleCount, logs.length, isLive]);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [visibleCount]);
-
-  const displayed = logs.slice(0, visibleCount);
+  }, [logs.length]);
 
   return (
     <div className="flex flex-col gap-1 overflow-y-auto p-4">
-      {displayed.map((log) => {
+      {logs.map((log) => {
         const cfg = eventConfig[log.event_type];
         const Icon = cfg.icon;
         return (
@@ -82,14 +65,14 @@ export function AgentStream({ logs, isLive }: AgentStreamProps) {
         );
       })}
 
-      {isLive && visibleCount < logs.length && (
+      {isLive && (
         <div className="flex items-center gap-2 p-3 text-sm text-zinc-400">
           <Loader2 className="h-4 w-4 animate-spin" />
           Agent is working...
         </div>
       )}
 
-      {visibleCount >= logs.length && logs.length > 0 && (
+      {!isLive && logs.length > 0 && logs[logs.length - 1]?.event_type === "done" && (
         <div className="flex items-center gap-2 p-3 text-sm text-emerald-400">
           <CheckCircle2 className="h-4 w-4" />
           Review complete

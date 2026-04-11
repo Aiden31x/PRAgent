@@ -1,13 +1,24 @@
 "use client";
 
-import { useState } from "react";
 import { Header } from "@/components/header";
 import { Key, Webhook, Bell } from "lucide-react";
 import { GithubIcon } from "@/components/icons";
 import { cn } from "@/lib/utils";
+import { isAuthenticated, getCurrentUser, clearToken } from "@/lib/auth";
+import { getLoginUrl } from "@/lib/api";
 
 export default function SettingsPage() {
-  const [connected, setConnected] = useState(false);
+  const authed = isAuthenticated();
+  const user = getCurrentUser();
+
+  function handleConnect() {
+    window.location.href = getLoginUrl();
+  }
+
+  function handleDisconnect() {
+    clearToken();
+    window.location.href = "/";
+  }
 
   return (
     <div className="min-h-screen">
@@ -28,20 +39,20 @@ export default function SettingsPage() {
             integration.
           </p>
           <button
-            onClick={() => setConnected(!connected)}
+            onClick={authed ? handleDisconnect : handleConnect}
             className={cn(
               "mt-4 rounded-lg px-4 py-2 text-sm font-medium transition-colors",
-              connected
+              authed
                 ? "bg-zinc-200 text-zinc-700 dark:bg-zinc-700 dark:text-zinc-300"
                 : "bg-zinc-900 text-white dark:bg-white dark:text-zinc-900"
             )}
           >
-            {connected ? "Disconnect GitHub" : "Connect GitHub"}
+            {authed ? "Disconnect GitHub" : "Connect GitHub"}
           </button>
-          {connected && (
+          {authed && user && (
             <div className="mt-3 flex items-center gap-2 text-sm text-emerald-500">
               <div className="h-2 w-2 rounded-full bg-emerald-500" />
-              Connected as @aidenuser
+              Connected as @{user.username}
             </div>
           )}
         </section>
@@ -88,24 +99,9 @@ export default function SettingsPage() {
             <h3 className="text-sm font-semibold">Webhook Configuration</h3>
           </div>
           <p className="mt-2 text-sm text-zinc-500 dark:text-zinc-400">
-            Set up webhooks to automatically review new PRs when they are
-            opened.
+            Webhooks are automatically created when you add a repository from the
+            dashboard. PRAgent will review new PRs as they are opened.
           </p>
-          <div className="mt-4">
-            <label className="mb-1 block text-xs font-medium text-zinc-500">
-              Webhook URL
-            </label>
-            <div className="flex gap-2">
-              <input
-                readOnly
-                value="https://your-domain.com/webhooks/github"
-                className="flex-1 rounded-lg border border-zinc-300 bg-zinc-50 px-3 py-2 text-sm dark:border-zinc-700 dark:bg-zinc-800"
-              />
-              <button className="rounded-lg border border-zinc-300 px-3 py-2 text-sm transition-colors hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800">
-                Copy
-              </button>
-            </div>
-          </div>
         </section>
 
         {/* Notifications */}

@@ -13,7 +13,7 @@ from sqlalchemy.orm import selectinload
 from app.agent.orchestrator import post_review_to_github, run_review
 from app.auth.dependencies import get_current_user
 from app.database import get_db
-from app.models import Repo, Review, ReviewComment, ReviewStatus, User
+from app.models import AgentLog, Repo, Review, ReviewComment, ReviewStatus, User
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +62,7 @@ class ReviewDetailResponse(BaseModel):
     warning_count: int
     info_count: int
     github_review_posted: bool
+    created_at: str
     comments: list[ReviewCommentResponse]
 
 
@@ -159,6 +160,82 @@ async def get_review(
     return _review_to_response(review)
 
 
+@router.get("/{review_id}/comments", response_model=list[ReviewCommentResponse])
+async def get_review_comments(
+    review_id: int,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> list[ReviewCommentResponse]:
+    """List all comments for a review."""
+    stmt = (
+        select(Review)
+        .join(Repo)
+        .where(Review.id == review_id, Repo.user_id == user.id)
+    )
+    result = await db.execute(stmt)
+    review = result.scalar_one_or_none()
+    if review is None:
+        raise HTTPException(status_code=404, detail="Review not found")
+
+    comments_result = await db.execute(
+        select(ReviewComment)
+        .where(ReviewComment.review_id == review_id)
+        .order_by(ReviewComment.id)
+    )
+    return [
+        ReviewCommentResponse(
+            id=c.id,
+            file_path=c.file_path,
+            line_number=c.line_number,
+            category=c.category.value,
+            severity=c.severity.value,
+            body=c.body,
+            fix_suggestion=c.fix_suggestion,
+        )
+        for c in comments_result.scalars().all()
+    ]
+
+
+class AgentLogResponse(BaseModel):
+    id: int
+    event_type: str
+    content: str
+    created_at: str
+
+
+@router.get("/{review_id}/logs", response_model=list[AgentLogResponse])
+async def get_review_logs(
+    review_id: int,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> list[AgentLogResponse]:
+    """List agent logs for a review (thought stream)."""
+    stmt = (
+        select(Review)
+        .join(Repo)
+        .where(Review.id == review_id, Repo.user_id == user.id)
+    )
+    result = await db.execute(stmt)
+    review = result.scalar_one_or_none()
+    if review is None:
+        raise HTTPException(status_code=404, detail="Review not found")
+
+    logs_result = await db.execute(
+        select(AgentLog)
+        .where(AgentLog.review_id == review_id)
+        .order_by(AgentLog.id)
+    )
+    return [
+        AgentLogResponse(
+            id=log.id,
+            event_type=log.event_type.value,
+            content=log.content,
+            created_at=log.created_at.isoformat() if log.created_at else "",
+        )
+        for log in logs_result.scalars().all()
+    ]
+
+
 @router.post("/{review_id}/post-to-github")
 async def post_to_github(
     review_id: int,
@@ -219,6 +296,7 @@ def _review_to_response(review: Review) -> ReviewDetailResponse:
         warning_count=review.warning_count,
         info_count=review.info_count,
         github_review_posted=review.github_review_posted,
+        created_at=review.created_at.isoformat() if review.created_at else "",
         comments=[
             ReviewCommentResponse(
                 id=c.id,
