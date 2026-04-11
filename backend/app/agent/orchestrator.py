@@ -291,67 +291,86 @@ async def run_review(
 # ------------------------------------------------------------------
 
 
+REVIEW_MARKER = "---REVIEW_COMPLETE---"
+
+
 def parse_block_type(text: str) -> str:
     """Classify a model text response into REVIEW_COMPLETE, THOUGHT, or UNKNOWN.
 
-    Checks REVIEW_COMPLETE first (it may appear alongside a THOUGHT preamble).
+    Uses the distinctive ---REVIEW_COMPLETE--- marker to avoid false positives
+    from code snippets that happen to contain "REVIEW_COMPLETE".
     """
-    upper = text.upper()
-    if "REVIEW_COMPLETE" in upper:
+    if REVIEW_MARKER in text:
         return "REVIEW_COMPLETE"
     if re.search(r"^THOUGHT\s*:", text, re.IGNORECASE | re.MULTILINE):
         return "THOUGHT"
     return "UNKNOWN"
 
 
+REQUIRED_REVIEW_KEYS = {"summary", "comments"}
+
+
 def extract_review_json(text: str) -> dict[str, Any] | None:
-    """Extract the JSON object following a REVIEW_COMPLETE marker.
+    """Extract the JSON object following the ---REVIEW_COMPLETE--- marker.
 
     Handles:
     - Raw JSON after the marker
     - JSON wrapped in ```json ... ``` fences
-    - Leading/trailing whitespace and text around the JSON
+    - Multiple { } blocks (skips non-review objects like code snippets)
     """
-    # Find everything after the REVIEW_COMPLETE marker
-    pattern = re.compile(r"REVIEW_COMPLETE\s*", re.IGNORECASE)
-    match = pattern.search(text)
-    if not match:
+    idx = text.find(REVIEW_MARKER)
+    if idx == -1:
         return None
 
-    after_marker = text[match.end():]
+    after_marker = text[idx + len(REVIEW_MARKER):]
 
     # Strip markdown fences if present
     fence_pattern = re.compile(r"```(?:json)?\s*\n?(.*?)\n?\s*```", re.DOTALL)
     fence_match = fence_pattern.search(after_marker)
     if fence_match:
-        json_str = fence_match.group(1)
-    else:
-        json_str = after_marker
+        after_marker = fence_match.group(1)
 
-    # Find the outermost JSON object
-    brace_start = json_str.find("{")
-    if brace_start == -1:
-        logger.error("No JSON object found after REVIEW_COMPLETE. Raw text:\n%s", after_marker[:500])
-        return None
+    # Try each top-level { } block until we find one that parses as valid
+    # review JSON (has "summary" and "comments" keys). This skips code
+    # snippets the model may have included before the actual JSON.
+    search_from = 0
+    while True:
+        brace_start = after_marker.find("{", search_from)
+        if brace_start == -1:
+            logger.error(
+                "No valid review JSON found after %s. Raw text:\n%s",
+                REVIEW_MARKER, after_marker[:500],
+            )
+            return None
 
-    depth = 0
-    for i, ch in enumerate(json_str[brace_start:], start=brace_start):
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                json_str = json_str[brace_start : i + 1]
-                break
-    else:
-        logger.error("Unbalanced braces in JSON. Raw text:\n%s", json_str[:500])
-        return None
+        depth = 0
+        end = -1
+        for i, ch in enumerate(after_marker[brace_start:], start=brace_start):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
 
-    try:
-        return json.loads(json_str)
-    except json.JSONDecodeError as exc:
-        logger.error("JSON parse failed: %s\nRaw:\n%s", exc, json_str[:500])
-        return None
+        if end == -1:
+            logger.error("Unbalanced braces in JSON. Raw text:\n%s", after_marker[:500])
+            return None
+
+        candidate = after_marker[brace_start : end + 1]
+
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            search_from = end + 1
+            continue
+
+        if isinstance(parsed, dict) and REQUIRED_REVIEW_KEYS.issubset(parsed.keys()):
+            return parsed
+
+        logger.debug("Skipping non-review JSON object: keys=%s", list(parsed.keys()) if isinstance(parsed, dict) else type(parsed))
+        search_from = end + 1
 
 
 # ------------------------------------------------------------------
