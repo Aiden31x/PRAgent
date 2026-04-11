@@ -22,9 +22,15 @@ export default function DashboardPage() {
   const [addingRepo, setAddingRepo] = useState(false);
   const [triggeringPr, setTriggeringPr] = useState<number | null>(null);
   const [error, setError] = useState("");
+  const [authed, setAuthed] = useState<boolean | null>(null);
 
   useEffect(() => {
-    if (!isAuthenticated()) return;
+    const authenticated = isAuthenticated();
+    setAuthed(authenticated);
+    if (!authenticated) {
+      setLoading(false);
+      return;
+    }
     loadData();
   }, []);
 
@@ -115,7 +121,18 @@ export default function DashboardPage() {
       ? (totalComments / completedReviews.length).toFixed(1)
       : "0";
 
-  if (!isAuthenticated()) {
+  if (authed === null) {
+    return (
+      <div className="min-h-screen">
+        <Header title="AI PR Review Dashboard" />
+        <div className="flex items-center justify-center py-12">
+          <Loader2 className="h-6 w-6 animate-spin text-zinc-400" />
+        </div>
+      </div>
+    );
+  }
+
+  if (!authed) {
     return (
       <div className="min-h-screen">
         <Header title="AI PR Review Dashboard" />

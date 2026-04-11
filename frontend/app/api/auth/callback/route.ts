@@ -21,7 +21,7 @@ export async function GET(request: NextRequest) {
     }
 
     const data = await res.json();
-    const token: string = data.token;
+    const token: string = data.access_token;
 
     const response = NextResponse.redirect(new URL("/", request.url));
     response.cookies.set("pragent_token", token, {

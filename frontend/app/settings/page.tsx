@@ -1,18 +1,26 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import { Header } from "@/components/header";
 import { Key, Webhook, Bell } from "lucide-react";
 import { GithubIcon } from "@/components/icons";
 import { cn } from "@/lib/utils";
-import { isAuthenticated, getCurrentUser, clearToken } from "@/lib/auth";
+import { isAuthenticated, getCurrentUser, clearToken, type TokenUser } from "@/lib/auth";
 import { getLoginUrl } from "@/lib/api";
 
 export default function SettingsPage() {
-  const authed = isAuthenticated();
-  const user = getCurrentUser();
+  const [authed, setAuthed] = useState(false);
+  const [user, setUser] = useState<TokenUser | null>(null);
 
-  function handleConnect() {
-    window.location.href = getLoginUrl();
+  useEffect(() => {
+    setAuthed(isAuthenticated());
+    setUser(getCurrentUser());
+  }, []);
+
+  async function handleConnect() {
+    const res = await fetch(getLoginUrl());
+    const data = await res.json();
+    window.location.href = data.url;
   }
 
   function handleDisconnect() {

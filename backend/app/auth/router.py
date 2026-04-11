@@ -46,6 +46,10 @@ class TokenResponse(BaseModel):
     user: UserProfile
 
 
+class CallbackRequest(BaseModel):
+    code: str
+
+
 class UserProfile(BaseModel):
     id: int
     github_username: str
@@ -78,7 +82,7 @@ async def github_login() -> LoginURLResponse:
 
 @router.post("/github/callback", response_model=TokenResponse)
 async def github_callback(
-    code: str,
+    body: CallbackRequest,
     db: AsyncSession = Depends(get_db),
 ) -> TokenResponse:
     """Exchange a GitHub OAuth code for an access token.
@@ -95,7 +99,7 @@ async def github_callback(
             json={
                 "client_id": settings.github_client_id,
                 "client_secret": settings.github_client_secret,
-                "code": code,
+                "code": body.code,
             },
             headers={"Accept": "application/json"},
         )

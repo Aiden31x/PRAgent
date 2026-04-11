@@ -557,7 +557,7 @@ async def post_review_to_github(
                         "path": c.file_path,
                         "line": c.line_number,
                         "body": comment_body,
-                        "subjectType": "line",
+                        "subjectType": "LINE",
                     },
                 )
                 posted_count += 1
@@ -579,7 +579,7 @@ async def post_review_to_github(
                     "owner": owner,
                     "repo": repo,
                     "pullNumber": pr_number,
-                    "method": "submit",
+                    "method": "submit_pending",
                     "event": submit_event,
                     "body": review_body,
                 },
@@ -594,7 +594,7 @@ async def post_review_to_github(
                         "owner": owner,
                         "repo": repo,
                         "pullNumber": pr_number,
-                        "method": "submit",
+                        "method": "submit_pending",
                         "event": "COMMENT",
                         "body": review_body,
                     },
