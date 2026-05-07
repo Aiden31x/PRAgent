@@ -118,7 +118,7 @@ cp .env.example .env
 | `GITHUB_CLIENT_SECRET` | GitHub OAuth App client secret |
 | `GITHUB_TOKEN` | GitHub Personal Access Token (used by the MCP server) |
 | `GEMINI_API_KEY` | Google Gemini API key |
-| `GEMINI_MODEL` | Gemini model to use (e.g. `gemini-2.0-flash`) |
+| `GEMINI_MODEL` | Gemini model to use (e.g. `gemini-3-flash-preview`; see [Gemini models](https://ai.google.dev/gemini-api/docs/models)) |
 | `JWT_SECRET` | Random secret for signing JWTs |
 | `WEBHOOK_SECRET` | Secret for verifying GitHub webhook payloads |
 | `WEBHOOK_URL` | Public URL for the webhook endpoint (use [smee.io](https://smee.io) for local dev) |

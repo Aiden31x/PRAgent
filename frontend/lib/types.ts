@@ -95,13 +95,14 @@ export const LLM_PROVIDERS: { id: LLMProvider; label: string }[] = [
 
 export const LLM_MODELS: Record<LLMProvider, { id: string; label: string }[]> = {
   gemini: [
+    { id: "gemini-3-flash-preview", label: "Gemini 3 Flash (preview)" },
+    { id: "gemini-3.1-pro-preview", label: "Gemini 3.1 Pro (preview)" },
     { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash" },
-    { id: "gemini-2.0-flash", label: "Gemini 2.0 Flash" },
-    { id: "gemini-1.5-pro", label: "Gemini 1.5 Pro" },
+    { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro" },
   ],
   claude: [
-    { id: "claude-3-5-sonnet-20241022", label: "Claude 3.5 Sonnet" },
-    { id: "claude-3-5-haiku-20241022", label: "Claude 3.5 Haiku" },
-    { id: "claude-3-opus-20240229", label: "Claude 3 Opus" },
+    { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6" },
+    { id: "claude-opus-4-7", label: "Claude Opus 4.7" },
+    { id: "claude-haiku-4-5", label: "Claude Haiku 4.5" },
   ],
 };

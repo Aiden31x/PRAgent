@@ -54,11 +54,13 @@ class Settings(BaseSettings):
     # --- LLM providers ---
     # Gemini
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-2.5-flash"
+    # See https://ai.google.dev/gemini-api/docs/models (Gemini 3.x is current generation)
+    gemini_model: str = "gemini-3-flash-preview"
 
     # Claude (Anthropic)
     anthropic_api_key: str = ""
-    claude_default_model: str = "claude-3-5-sonnet-20241022"
+    # See https://docs.anthropic.com/en/docs/about-claude/models
+    claude_default_model: str = "claude-sonnet-4-6"
 
     # Which provider to use when no user preference is set
     default_llm_provider: str = "gemini"

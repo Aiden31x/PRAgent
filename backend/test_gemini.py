@@ -19,6 +19,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+gemini_model = os.environ.get("GEMINI_MODEL", "gemini-3-flash-preview")
+
 api_key = os.environ.get("GEMINI_API_KEY", "")
 if not api_key:
     print("ERROR: GEMINI_API_KEY not set in .env — get one at https://aistudio.google.com/apikey")
@@ -63,7 +65,7 @@ first_user_msg = build_first_user_message(
 )
 
 chat = client.chats.create(
-    model="gemini-2.0-flash",
+    model=gemini_model,
     config=types.GenerateContentConfig(
         system_instruction=SYSTEM_PROMPT,
     ),

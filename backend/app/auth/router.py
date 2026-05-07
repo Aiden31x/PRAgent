@@ -168,6 +168,8 @@ async def github_callback(
             id=user.id,
             github_username=username,
             avatar_url=avatar,
+            preferred_llm_provider=user.preferred_llm_provider,
+            preferred_llm_model=user.preferred_llm_model,
         ),
     )
 
