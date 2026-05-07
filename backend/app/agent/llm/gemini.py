@@ -1,0 +1,137 @@
+"""Gemini (Google) LLM provider for the PRAgent ReAct loop.
+
+Extracted from orchestrator.py so the loop itself stays provider-agnostic.
+"""
+
+from __future__ import annotations
+
+import logging
+import uuid
+from typing import Any
+
+from google import genai
+from google.genai import types as genai_types
+
+from app.agent.llm.base import LLMProvider, LLMResponse, ToolCall, ToolResult
+from app.config import settings
+
+logger = logging.getLogger(__name__)
+
+
+class GeminiProvider(LLMProvider):
+    """Drives the ReAct loop via the Google Gemini API."""
+
+    def __init__(self, model: str) -> None:
+        self._model = model
+        self._client = genai.Client(api_key=settings.gemini_api_key)
+        self._contents: list[genai_types.Content] = []
+        self._config: genai_types.GenerateContentConfig | None = None
+        self._json_only_config: genai_types.GenerateContentConfig | None = None
+        self._tool_names: set[str] = set()
+
+    @property
+    def tool_names(self) -> set[str]:
+        return self._tool_names
+
+    async def start(
+        self,
+        *,
+        system_prompt: str,
+        tools: list[dict[str, Any]],
+        first_message: str,
+    ) -> LLMResponse:
+        tool_declarations = [
+            genai_types.FunctionDeclaration(
+                name=t["name"],
+                description=t["description"],
+                parameters_json_schema=t["parameters"],
+            )
+            for t in tools
+        ]
+        self._tool_names = {t["name"] for t in tools}
+
+        self._config = genai_types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            tools=[genai_types.Tool(function_declarations=tool_declarations)],
+            tool_config=genai_types.ToolConfig(
+                function_calling_config=genai_types.FunctionCallingConfig(
+                    mode="VALIDATED",
+                ),
+            ),
+        )
+        self._json_only_config = genai_types.GenerateContentConfig(
+            system_instruction=system_prompt,
+        )
+
+        self._contents = [
+            genai_types.Content(
+                role="user", parts=[genai_types.Part(text=first_message)]
+            )
+        ]
+        return await self._generate()
+
+    async def submit_tool_results(self, results: list[ToolResult]) -> LLMResponse:
+        fn_response_parts = [
+            genai_types.Part(
+                function_response=genai_types.FunctionResponse(
+                    name=r.name,
+                    response={"result": r.content},
+                )
+            )
+            for r in results
+        ]
+        self._contents.append(
+            genai_types.Content(role="user", parts=fn_response_parts)
+        )
+        return await self._generate()
+
+    async def continue_after_thought(self) -> LLMResponse:
+        # Gemini can generate a continuation when the last message in
+        # contents is a model-role text block; no extra user turn needed.
+        return await self._generate()
+
+    async def generate_no_tools(self, message: str) -> LLMResponse:
+        self._contents.append(
+            genai_types.Content(role="user", parts=[genai_types.Part(text=message)])
+        )
+        response = await self._client.aio.models.generate_content(
+            model=self._model,
+            contents=self._contents,
+            config=self._json_only_config,
+        )
+        text = response.text or ""
+        self._contents.append(
+            genai_types.Content(role="model", parts=[genai_types.Part(text=text)])
+        )
+        return LLMResponse(text=text)
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    async def _generate(self) -> LLMResponse:
+        response = await self._client.aio.models.generate_content(
+            model=self._model,
+            contents=self._contents,
+            config=self._config,
+        )
+
+        if response.function_calls:
+            model_content = response.candidates[0].content
+            self._contents.append(model_content)
+            tool_calls = [
+                ToolCall(
+                    id=str(uuid.uuid4()),
+                    name=fc.name,
+                    args=dict(fc.args) if fc.args else {},
+                )
+                for fc in response.function_calls
+            ]
+            logger.debug("Gemini returned %d tool call(s)", len(tool_calls))
+            return LLMResponse(tool_calls=tool_calls)
+
+        text = response.text or ""
+        self._contents.append(
+            genai_types.Content(role="model", parts=[genai_types.Part(text=text)])
+        )
+        return LLMResponse(text=text)

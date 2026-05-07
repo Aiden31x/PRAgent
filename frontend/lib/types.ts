@@ -1,4 +1,5 @@
 export type ReviewStatus = "pending" | "reviewing" | "completed" | "failed";
+export type LLMProvider = "gemini" | "claude";
 export type Severity = "critical" | "warning" | "info";
 export type ReviewCategory =
   | "security"
@@ -19,6 +20,8 @@ export interface User {
   id: number;
   github_username: string;
   avatar_url: string | null;
+  preferred_llm_provider: LLMProvider;
+  preferred_llm_model: string | null;
   created_at: string;
 }
 
@@ -39,6 +42,8 @@ export interface Review {
   warning_count: number;
   info_count: number;
   github_review_posted: boolean;
+  llm_provider: LLMProvider;
+  llm_model: string;
   created_at: string;
   comments: ReviewComment[];
 }
@@ -74,4 +79,29 @@ export interface TriggerReviewResponse {
   review_id: number;
   status: string;
   findings_count: number;
+  llm_provider: LLMProvider;
+  llm_model: string;
 }
+
+export interface LLMPreferencesRequest {
+  preferred_llm_provider: LLMProvider;
+  preferred_llm_model: string | null;
+}
+
+export const LLM_PROVIDERS: { id: LLMProvider; label: string }[] = [
+  { id: "gemini", label: "Google Gemini" },
+  { id: "claude", label: "Anthropic Claude" },
+];
+
+export const LLM_MODELS: Record<LLMProvider, { id: string; label: string }[]> = {
+  gemini: [
+    { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash" },
+    { id: "gemini-2.0-flash", label: "Gemini 2.0 Flash" },
+    { id: "gemini-1.5-pro", label: "Gemini 1.5 Pro" },
+  ],
+  claude: [
+    { id: "claude-3-5-sonnet-20241022", label: "Claude 3.5 Sonnet" },
+    { id: "claude-3-5-haiku-20241022", label: "Claude 3.5 Haiku" },
+    { id: "claude-3-opus-20240229", label: "Claude 3 Opus" },
+  ],
+};

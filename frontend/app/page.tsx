@@ -8,7 +8,8 @@ import { ReviewTable } from "@/components/review-table";
 import { apiFetch } from "@/lib/api";
 import { formatNumber } from "@/lib/utils";
 import { isAuthenticated } from "@/lib/auth";
-import type { Repo, Review, PRSummary, TriggerReviewResponse } from "@/lib/types";
+import type { Repo, Review, PRSummary, TriggerReviewResponse, LLMProvider, User } from "@/lib/types";
+import { LLM_PROVIDERS, LLM_MODELS } from "@/lib/types";
 import { Plus, Loader2, FolderGit2 } from "lucide-react";
 
 export default function DashboardPage() {
@@ -24,6 +25,12 @@ export default function DashboardPage() {
   const [error, setError] = useState("");
   const [authed, setAuthed] = useState<boolean | null>(null);
 
+  // LLM provider selection — pre-filled from user's saved preference
+  const [selectedProvider, setSelectedProvider] = useState<LLMProvider>("gemini");
+  const [selectedModel, setSelectedModel] = useState<string>(
+    LLM_MODELS["gemini"][0].id
+  );
+
   useEffect(() => {
     const authenticated = isAuthenticated();
     setAuthed(authenticated);
@@ -31,6 +38,16 @@ export default function DashboardPage() {
       setLoading(false);
       return;
     }
+    // Load user preferences to pre-fill the LLM selector
+    apiFetch<User>("/auth/me")
+      .then((user) => {
+        const p = user.preferred_llm_provider ?? "gemini";
+        setSelectedProvider(p);
+        setSelectedModel(
+          user.preferred_llm_model ?? LLM_MODELS[p][0].id
+        );
+      })
+      .catch(() => {});
     loadData();
   }, []);
 
@@ -98,6 +115,8 @@ export default function DashboardPage() {
           base_branch: pr.base_branch,
           head_branch: pr.head_branch,
           changed_files: pr.changed_files,
+          provider: selectedProvider,
+          model: selectedModel || null,
         }),
       });
       router.push(`/review/${result.review_id}`);
@@ -106,6 +125,11 @@ export default function DashboardPage() {
     } finally {
       setTriggeringPr(null);
     }
+  }
+
+  function handleProviderChange(p: LLMProvider) {
+    setSelectedProvider(p);
+    setSelectedModel(LLM_MODELS[p][0].id);
   }
 
   function selectRepo(repo: Repo) {
@@ -212,6 +236,41 @@ export default function DashboardPage() {
             value={loading ? "—" : avgIssues}
           />
         </div>
+
+        {/* LLM selector — shown when repos are present */}
+        {repos.length > 0 && (
+          <div className="flex flex-wrap items-center gap-3 rounded-xl border border-zinc-200 bg-zinc-50 p-4 dark:border-zinc-800 dark:bg-zinc-900">
+            <span className="text-xs font-medium text-zinc-500 dark:text-zinc-400">
+              Review with:
+            </span>
+            <div className="flex gap-1.5">
+              {LLM_PROVIDERS.map((p) => (
+                <button
+                  key={p.id}
+                  onClick={() => handleProviderChange(p.id)}
+                  className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
+                    selectedProvider === p.id
+                      ? "bg-blue-600 text-white"
+                      : "bg-zinc-200 text-zinc-700 hover:bg-zinc-300 dark:bg-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-600"
+                  }`}
+                >
+                  {p.label}
+                </button>
+              ))}
+            </div>
+            <select
+              value={selectedModel}
+              onChange={(e) => setSelectedModel(e.target.value)}
+              className="rounded-md border border-zinc-300 bg-white px-3 py-1.5 text-xs outline-none transition-colors focus:border-blue-500 dark:border-zinc-700 dark:bg-zinc-800 dark:text-white"
+            >
+              {LLM_MODELS[selectedProvider].map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.label}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
 
         {/* Repo selector + PRs */}
         {repos.length > 0 && (

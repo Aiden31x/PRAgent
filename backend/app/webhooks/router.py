@@ -76,6 +76,8 @@ async def github_webhook(
     head_branch = pr.get("head", {}).get("ref", "")
     sender_login = payload.get("sender", {}).get("login", "")
     changed_files: list[str] = []
+    preferred_provider: str = "gemini"
+    preferred_model: str | None = None
 
     if not repo_full_name or not pr_number:
         logger.warning("Webhook missing repo or PR number")
@@ -121,11 +123,19 @@ async def github_webhook(
                 return Response(status_code=200, content="OK")
 
         # -- Step 4: Create Review row and schedule background task ----
+        preferred_provider = user.preferred_llm_provider
+        preferred_model = user.preferred_llm_model
+
+        from app.config import settings as _settings
+        resolved_model = preferred_model or _settings.default_model_for(preferred_provider)
+
         review = Review(
             repo_id=repo.id,
             pr_number=pr_number,
             pr_title=pr_title or f"PR #{pr_number}",
             status=ReviewStatus.PENDING,
+            llm_provider=preferred_provider,
+            llm_model=resolved_model,
         )
         db.add(review)
         await db.flush()
@@ -135,8 +145,8 @@ async def github_webhook(
         await db.commit()
 
     logger.info(
-        "Webhook: created review %d for %s #%d — dispatching to background",
-        review_id, repo_full_name, pr_number,
+        "Webhook: created review %d for %s #%d — dispatching to background (provider=%s)",
+        review_id, repo_full_name, pr_number, preferred_provider,
     )
 
     background_tasks.add_task(
@@ -150,6 +160,8 @@ async def github_webhook(
         changed_files=changed_files,
         github_token=github_token,
         review_id=review_id,
+        provider=preferred_provider,
+        model=preferred_model,
     )
 
     return Response(status_code=200, content="OK")
@@ -166,6 +178,8 @@ async def _run_review_background(
     changed_files: list[str],
     github_token: str,
     review_id: int,
+    provider: str = "gemini",
+    model: str | None = None,
 ) -> None:
     """Run a review in the background with its own DB session."""
     async with async_session() as db:
@@ -181,6 +195,8 @@ async def _run_review_background(
                 github_token=github_token,
                 review_id=review_id,
                 db=db,
+                provider=provider,
+                model=model,
             )
         except Exception:
             logger.exception(

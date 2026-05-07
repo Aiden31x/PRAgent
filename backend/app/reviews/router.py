@@ -12,6 +12,7 @@ from sqlalchemy.orm import selectinload
 
 from app.agent.orchestrator import post_review_to_github, run_review
 from app.auth.dependencies import get_current_user
+from app.config import settings
 from app.database import get_db
 from app.models import AgentLog, Repo, Review, ReviewComment, ReviewStatus, User
 
@@ -33,12 +34,16 @@ class TriggerReviewRequest(BaseModel):
     base_branch: str = "main"
     head_branch: str = ""
     changed_files: list[str] = []
+    provider: str | None = None   # "gemini" or "claude"; falls back to user preference
+    model: str | None = None      # specific model string; falls back to provider default
 
 
 class TriggerReviewResponse(BaseModel):
     review_id: int
     status: str
     findings_count: int
+    llm_provider: str
+    llm_model: str
 
 
 class ReviewCommentResponse(BaseModel):
@@ -62,6 +67,8 @@ class ReviewDetailResponse(BaseModel):
     warning_count: int
     info_count: int
     github_review_posted: bool
+    llm_provider: str
+    llm_model: str
     created_at: str
     comments: list[ReviewCommentResponse]
 
@@ -83,18 +90,33 @@ async def trigger_review(
     if repo is None or repo.user_id != user.id:
         raise HTTPException(status_code=404, detail="Repo not found")
 
+    # Resolve provider/model: request body > user preference > global default
+    resolved_provider = (
+        body.provider
+        or user.preferred_llm_provider
+        or settings.default_llm_provider
+    )
+    resolved_model = (
+        body.model
+        or user.preferred_llm_model
+        or settings.default_model_for(resolved_provider)
+    )
+
     review = Review(
         repo_id=repo.id,
         pr_number=body.pr_number,
         pr_title=body.pr_title or f"PR #{body.pr_number}",
         status=ReviewStatus.PENDING,
+        llm_provider=resolved_provider,
+        llm_model=resolved_model,
     )
     db.add(review)
     await db.flush()
 
     logger.info(
-        "User %s triggered review %d for %s #%d",
+        "User %s triggered review %d for %s #%d (provider=%s model=%s)",
         user.github_username, review.id, repo.full_name, body.pr_number,
+        resolved_provider, resolved_model,
     )
 
     await run_review(
@@ -108,6 +130,8 @@ async def trigger_review(
         github_token=user.github_token,
         review_id=review.id,
         db=db,
+        provider=resolved_provider,
+        model=resolved_model,
     )
 
     await db.refresh(review)
@@ -116,6 +140,8 @@ async def trigger_review(
         review_id=review.id,
         status=review.status.value,
         findings_count=review.total_comments,
+        llm_provider=resolved_provider,
+        llm_model=resolved_model,
     )
 
 
@@ -296,6 +322,8 @@ def _review_to_response(review: Review) -> ReviewDetailResponse:
         warning_count=review.warning_count,
         info_count=review.info_count,
         github_review_posted=review.github_review_posted,
+        llm_provider=review.llm_provider,
+        llm_model=review.llm_model,
         created_at=review.created_at.isoformat() if review.created_at else "",
         comments=[
             ReviewCommentResponse(

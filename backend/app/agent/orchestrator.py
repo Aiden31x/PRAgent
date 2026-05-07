@@ -1,8 +1,12 @@
 """ReAct agent orchestrator — the core of PRAgent.
 
-Drives a Gemini 2.5 Flash model through a Reason → Act → Observe loop,
-routing tool calls through the MCP client to the GitHub MCP server, and
-persisting the final structured review to the database.
+Drives an LLM through a Reason → Act → Observe loop, routing tool calls
+through the MCP client to the GitHub MCP server, and persisting the final
+structured review to the database.
+
+The LLM is swappable at call time via the provider/model parameters.
+Provider-specific SDK code lives in app/agent/llm/; the loop itself is
+fully provider-agnostic.
 """
 
 from __future__ import annotations
@@ -12,10 +16,10 @@ import logging
 import re
 from typing import Any
 
-from google import genai
-from google.genai import types as genai_types
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agent.llm.base import ToolResult
+from app.agent.llm.factory import get_provider
 from app.agent.prompts import (
     FORCE_CONCLUDE,
     RETRY_MALFORMED_JSON,
@@ -24,7 +28,7 @@ from app.agent.prompts import (
 )
 from app.agent.schemas import ReviewOutput
 from app.config import settings
-from app.mcp.bridge import mcp_tools_to_gemini_declarations
+from app.mcp.bridge import mcp_tools_to_declarations
 from app.mcp.client import MCPClientManager
 from app.models import (
     AgentEventType,
@@ -57,39 +61,39 @@ async def run_review(
     github_token: str,
     review_id: int,
     db: AsyncSession,
+    provider: str = "gemini",
+    model: str | None = None,
 ) -> int:
     """Run a full agentic PR review and persist results.
+
+    Parameters
+    ----------
+    provider:
+        LLM provider name — ``"gemini"`` or ``"claude"``.
+    model:
+        Specific model string.  Defaults to the configured default for
+        the chosen provider when not supplied.
 
     Returns the review_id on success.
     """
     owner, repo = repo_full_name.split("/", 1)
-    client = MCPClientManager()
+    mcp_client = MCPClientManager()
+    resolved_model = model or settings.default_model_for(provider)
+    llm = get_provider(provider, resolved_model)
 
     try:
         # ---- 1. SETUP ------------------------------------------------
         await _update_review_status(db, review_id, ReviewStatus.REVIEWING)
 
         logger.info("[review=%d] Connecting to GitHub MCP server…", review_id)
-        await client.connect(github_token)
+        await mcp_client.connect(github_token)
 
-        mcp_tools = await client.list_tools()
-        gemini_decls = mcp_tools_to_gemini_declarations(mcp_tools)
+        mcp_tools = await mcp_client.list_tools()
+        tool_dicts = mcp_tools_to_declarations(mcp_tools)
         logger.info(
-            "[review=%d] %d Gemini tool declarations ready",
-            review_id,
-            len(gemini_decls),
+            "[review=%d] %d tool declarations ready (provider=%s model=%s)",
+            review_id, len(tool_dicts), provider, resolved_model,
         )
-
-        gemini = genai.Client(api_key=settings.gemini_api_key)
-
-        tool_declarations = [
-            genai_types.FunctionDeclaration(
-                name=d["name"],
-                description=d["description"],
-                parameters_json_schema=d["parameters"],
-            )
-            for d in gemini_decls
-        ]
 
         first_user_msg = build_first_user_message(
             owner=owner,
@@ -102,102 +106,62 @@ async def run_review(
             changed_files=changed_files,
         )
 
-        contents: list[genai_types.Content] = [
-            genai_types.Content(role="user", parts=[genai_types.Part(text=first_user_msg)]),
-        ]
-
-        config = genai_types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            tools=[genai_types.Tool(function_declarations=tool_declarations)],
-            tool_config=genai_types.ToolConfig(
-                function_calling_config=genai_types.FunctionCallingConfig(
-                    mode="VALIDATED",
-                ),
-            ),
-        )
-
-        declared_names = {d["name"] for d in gemini_decls}
-
-        json_only_config = genai_types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-        )
-
         # ---- 2. REACT LOOP -------------------------------------------
         review_output: ReviewOutput | None = None
+
+        response = await llm.start(
+            system_prompt=SYSTEM_PROMPT,
+            tools=tool_dicts,
+            first_message=first_user_msg,
+        )
 
         for iteration in range(1, MAX_ITERATIONS + 1):
             logger.info("[review=%d] Iteration %d/%d", review_id, iteration, MAX_ITERATIONS)
 
-            response = await gemini.aio.models.generate_content(
-                model=settings.gemini_model,
-                contents=contents,
-                config=config,
-            )
+            # -- Case A: tool calls from model --------------------------
+            if response.has_tool_calls:
+                tool_results: list[ToolResult] = []
 
-            # -- Case A: function call(s) from model --------------------
-            if response.function_calls:
-                model_content = response.candidates[0].content
-                contents.append(model_content)
-
-                fn_response_parts: list[genai_types.Part] = []
-
-                for fc in response.function_calls:
-                    tool_name = fc.name
-                    tool_args = fc.args or {}
-
+                for tc in response.tool_calls:
                     logger.info(
                         "[review=%d] Tool call: %s(%s)",
-                        review_id, tool_name, _trunc(str(tool_args)),
+                        review_id, tc.name, _trunc(str(tc.args)),
                     )
                     await _log_agent_event(
                         db, review_id, AgentEventType.FETCHING,
-                        f"Calling {tool_name}",
+                        f"Calling {tc.name}",
                     )
 
-                    if tool_name not in declared_names:
+                    if tc.name not in llm.tool_names:
                         logger.warning(
                             "[review=%d] Hallucinated tool '%s' — not in declared set",
-                            review_id, tool_name,
+                            review_id, tc.name,
                         )
                         result_text = (
-                            f"ERROR: Unknown tool '{tool_name}'. "
-                            f"Available tools: {sorted(declared_names)}"
+                            f"ERROR: Unknown tool '{tc.name}'. "
+                            f"Available tools: {sorted(llm.tool_names)}"
                         )
                     else:
                         try:
-                            mcp_result = await client.call_tool(tool_name, tool_args)
+                            mcp_result = await mcp_client.call_tool(tc.name, tc.args)
                             result_text = _extract_mcp_text(mcp_result)
                         except Exception as exc:
                             logger.warning(
                                 "[review=%d] Tool %s failed: %s",
-                                review_id, tool_name, exc,
+                                review_id, tc.name, exc,
                             )
                             result_text = f"ERROR: {exc}"
 
-                    fn_response_parts.append(
-                        genai_types.Part(
-                            function_response=genai_types.FunctionResponse(
-                                name=tool_name,
-                                response={"result": result_text},
-                            )
-                        )
+                    tool_results.append(
+                        ToolResult(call_id=tc.id, name=tc.name, content=result_text)
                     )
 
-                contents.append(
-                    genai_types.Content(role="user", parts=fn_response_parts)
-                )
+                response = await llm.submit_tool_results(tool_results)
                 continue
 
             # -- Case B: text response ----------------------------------
             text = response.text or ""
             block_type = parse_block_type(text)
-
-            contents.append(
-                genai_types.Content(
-                    role="model",
-                    parts=[genai_types.Part(text=text)],
-                )
-            )
 
             if block_type == "REVIEW_COMPLETE":
                 logger.info("[review=%d] Agent signalled REVIEW_COMPLETE", review_id)
@@ -206,25 +170,8 @@ async def run_review(
                 review_output = _try_parse_review(text)
                 if review_output is None:
                     logger.warning("[review=%d] Malformed JSON — requesting retry (no tools)", review_id)
-                    contents.append(
-                        genai_types.Content(
-                            role="user",
-                            parts=[genai_types.Part(text=RETRY_MALFORMED_JSON)],
-                        )
-                    )
-                    retry_resp = await gemini.aio.models.generate_content(
-                        model=settings.gemini_model,
-                        contents=contents,
-                        config=json_only_config,
-                    )
-                    retry_text = retry_resp.text or ""
-                    contents.append(
-                        genai_types.Content(
-                            role="model",
-                            parts=[genai_types.Part(text=retry_text)],
-                        )
-                    )
-                    review_output = _try_parse_review(retry_text)
+                    retry_resp = await llm.generate_no_tools(RETRY_MALFORMED_JSON)
+                    review_output = _try_parse_review(retry_resp.text or "")
 
                 break
 
@@ -241,22 +188,13 @@ async def run_review(
                     db, review_id, AgentEventType.THINKING, text[:200],
                 )
 
+            response = await llm.continue_after_thought()
+
         # -- Force conclude if loop exhausted without REVIEW_COMPLETE ---
         if review_output is None:
             logger.warning("[review=%d] Max iterations reached — forcing conclude (no tools)", review_id)
-            contents.append(
-                genai_types.Content(
-                    role="user",
-                    parts=[genai_types.Part(text=FORCE_CONCLUDE)],
-                )
-            )
-            force_resp = await gemini.aio.models.generate_content(
-                model=settings.gemini_model,
-                contents=contents,
-                config=json_only_config,
-            )
-            force_text = force_resp.text or ""
-            review_output = _try_parse_review(force_text)
+            force_resp = await llm.generate_no_tools(FORCE_CONCLUDE)
+            review_output = _try_parse_review(force_resp.text or "")
 
         # ---- 3. PERSIST RESULTS --------------------------------------
         if review_output is not None:
@@ -299,8 +237,8 @@ async def run_review(
         raise
 
     finally:
-        if client.is_connected:
-            await client.disconnect()
+        if mcp_client.is_connected:
+            await mcp_client.disconnect()
 
     return review_id
 
@@ -388,7 +326,10 @@ def extract_review_json(text: str) -> dict[str, Any] | None:
         if isinstance(parsed, dict) and REQUIRED_REVIEW_KEYS.issubset(parsed.keys()):
             return parsed
 
-        logger.debug("Skipping non-review JSON object: keys=%s", list(parsed.keys()) if isinstance(parsed, dict) else type(parsed))
+        logger.debug(
+            "Skipping non-review JSON object: keys=%s",
+            list(parsed.keys()) if isinstance(parsed, dict) else type(parsed),
+        )
         search_from = end + 1
 
 
@@ -483,7 +424,7 @@ async def _save_review_results(
 
 
 # ------------------------------------------------------------------
-# Phase 3a — Post review to GitHub via MCP
+# Post review to GitHub via MCP
 # ------------------------------------------------------------------
 
 
@@ -648,5 +589,3 @@ async def post_review_to_github(
     finally:
         if client.is_connected:
             await client.disconnect()
-
-

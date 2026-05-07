@@ -51,9 +51,23 @@ class Settings(BaseSettings):
     # --- GitHub PAT (used by MCP server) ---
     github_token: str = ""
 
-    # --- Gemini ---
+    # --- LLM providers ---
+    # Gemini
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.5-flash"
+
+    # Claude (Anthropic)
+    anthropic_api_key: str = ""
+    claude_default_model: str = "claude-3-5-sonnet-20241022"
+
+    # Which provider to use when no user preference is set
+    default_llm_provider: str = "gemini"
+
+    def default_model_for(self, provider: str) -> str:
+        """Return the configured default model name for a given provider."""
+        if provider == "claude":
+            return self.claude_default_model
+        return self.gemini_model
 
     # --- JWT ---
     jwt_secret: str = "change-me-in-production"

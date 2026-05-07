@@ -54,6 +54,13 @@ class UserProfile(BaseModel):
     id: int
     github_username: str
     avatar_url: str | None
+    preferred_llm_provider: str
+    preferred_llm_model: str | None
+
+
+class PreferencesRequest(BaseModel):
+    preferred_llm_provider: str
+    preferred_llm_model: str | None = None
 
 
 # Rebuild TokenResponse so it sees the now-defined UserProfile
@@ -172,6 +179,39 @@ async def get_me(user: User = Depends(get_current_user)) -> UserProfile:
         id=user.id,
         github_username=user.github_username,
         avatar_url=user.avatar_url,
+        preferred_llm_provider=user.preferred_llm_provider,
+        preferred_llm_model=user.preferred_llm_model,
+    )
+
+
+@router.patch("/me/preferences", response_model=UserProfile)
+async def update_preferences(
+    body: PreferencesRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> UserProfile:
+    """Update the authenticated user's LLM provider preference."""
+    valid_providers = {"gemini", "claude"}
+    if body.preferred_llm_provider not in valid_providers:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid provider '{body.preferred_llm_provider}'. Choose from: {sorted(valid_providers)}",
+        )
+
+    user.preferred_llm_provider = body.preferred_llm_provider
+    user.preferred_llm_model = body.preferred_llm_model
+    await db.flush()
+    logger.info(
+        "User %s updated LLM preference: provider=%s model=%s",
+        user.github_username, body.preferred_llm_provider, body.preferred_llm_model,
+    )
+
+    return UserProfile(
+        id=user.id,
+        github_username=user.github_username,
+        avatar_url=user.avatar_url,
+        preferred_llm_provider=user.preferred_llm_provider,
+        preferred_llm_model=user.preferred_llm_model,
     )
 
 

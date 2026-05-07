@@ -35,10 +35,10 @@ def _is_relevant_tool(tool_name: str) -> bool:
     return any(fragment in name_lower for fragment in ALLOWED_TOOL_FRAGMENTS)
 
 
-def mcp_tools_to_gemini_declarations(
+def mcp_tools_to_declarations(
     mcp_tools: list[Tool],
 ) -> list[dict[str, Any]]:
-    """Convert MCP tool definitions to Gemini function declaration dicts.
+    """Convert MCP tool definitions to provider-agnostic declaration dicts.
 
     Each declaration has the shape::
 
@@ -48,9 +48,9 @@ def mcp_tools_to_gemini_declarations(
             "parameters": { ... JSON Schema ... }
         }
 
-    Gemini accepts JSON Schema for ``parameters`` directly, so the
-    ``inputSchema`` from MCP is passed through with minimal cleanup.
-    Only tools matching ``ALLOWED_TOOL_FRAGMENTS`` are included.
+    The ``parameters`` value is passed through as raw JSON Schema; each
+    LLM provider adapter (Gemini, Claude, …) translates it to its own
+    wire format.  Only tools matching ``ALLOWED_TOOL_FRAGMENTS`` are included.
     """
     declarations: list[dict[str, Any]] = []
 
@@ -80,6 +80,10 @@ def mcp_tools_to_gemini_declarations(
     )
 
     return declarations
+
+
+# Backward-compatible alias (old name referenced from test scripts).
+mcp_tools_to_gemini_declarations = mcp_tools_to_declarations
 
 
 def get_tool_names(mcp_tools: list[Tool]) -> list[str]:
