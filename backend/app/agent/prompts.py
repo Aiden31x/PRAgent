@@ -311,6 +311,7 @@ def build_first_user_message(
     base_branch: str,
     head_branch: str,
     changed_files: list[str],
+    language_context: str = "",
 ) -> str:
     """Build the first user message containing PR-specific context.
 
@@ -318,6 +319,14 @@ def build_first_user_message(
     instructions.  All PR metadata lives here so the system prompt stays
     cacheable and the LLM sees the context right at the start of the
     conversation.
+
+    Parameters
+    ----------
+    language_context:
+        Optional language-specific review checklist produced by
+        ``app.agent.language_context.load_language_context``.  When non-empty
+        it is appended after the changed-file list so the LLM applies
+        language-aware heuristics on top of the core rubric.
     """
     if not pr_description or pr_description.strip() == "":
         pr_description = "(no description provided)"
@@ -328,7 +337,7 @@ def build_first_user_message(
         else "  (file list not available — fetch via tool)"
     )
 
-    return _FIRST_USER_MESSAGE_TEMPLATE.format(
+    msg = _FIRST_USER_MESSAGE_TEMPLATE.format(
         owner=owner,
         repo=repo,
         pr_number=pr_number,
@@ -339,6 +348,11 @@ def build_first_user_message(
         num_files=len(changed_files),
         changed_files_block=changed_files_block,
     )
+
+    if language_context:
+        msg += f"\n\n{language_context}"
+
+    return msg
 
 
 RETRY_MALFORMED_JSON = """\

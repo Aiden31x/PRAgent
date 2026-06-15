@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.llm.base import ToolResult
 from app.agent.llm.factory import get_provider
+from app.agent.language_context import load_language_context
 from app.agent.prompts import (
     FORCE_CONCLUDE,
     RETRY_MALFORMED_JSON,
@@ -104,6 +105,7 @@ async def run_review(
             base_branch=base_branch,
             head_branch=head_branch,
             changed_files=changed_files,
+            language_context=load_language_context(changed_files),
         )
 
         # ---- 2. REACT LOOP -------------------------------------------
