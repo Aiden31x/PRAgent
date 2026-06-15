@@ -1,11 +1,26 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import { useTheme } from "next-themes";
 import { Sun, Moon, LogOut } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { clearToken } from "@/lib/auth";
 
 export function Header({ title }: { title: string }) {
-  const { theme, setTheme } = useTheme();
+  const { resolvedTheme, setTheme } = useTheme();
+  const [mounted, setMounted] = useState(false);
+
+  useEffect(() => setMounted(true), []);
+
+  function handleSignOut() {
+    clearToken();
+    window.location.href = "/";
+  }
+
+  const inactive =
+    "text-zinc-400 hover:bg-zinc-100 hover:text-zinc-600 dark:hover:bg-zinc-800 dark:hover:text-zinc-200";
+  const active =
+    "bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-white";
 
   return (
     <header className="flex items-center justify-between border-b border-zinc-200 px-8 py-5 dark:border-zinc-800">
@@ -15,9 +30,7 @@ export function Header({ title }: { title: string }) {
           onClick={() => setTheme("light")}
           className={cn(
             "rounded-lg p-2 transition-colors",
-            theme === "light"
-              ? "bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-white"
-              : "text-zinc-400 hover:bg-zinc-100 hover:text-zinc-600 dark:hover:bg-zinc-800 dark:hover:text-zinc-200"
+            mounted && resolvedTheme === "light" ? active : inactive
           )}
           title="Light mode"
         >
@@ -27,9 +40,7 @@ export function Header({ title }: { title: string }) {
           onClick={() => setTheme("dark")}
           className={cn(
             "rounded-lg p-2 transition-colors",
-            theme === "dark"
-              ? "bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-white"
-              : "text-zinc-400 hover:bg-zinc-100 hover:text-zinc-600 dark:hover:bg-zinc-800 dark:hover:text-zinc-200"
+            mounted && resolvedTheme === "dark" ? active : inactive
           )}
           title="Dark mode"
         >
@@ -37,6 +48,7 @@ export function Header({ title }: { title: string }) {
         </button>
         <div className="mx-1 h-5 w-px bg-zinc-200 dark:bg-zinc-700" />
         <button
+          onClick={handleSignOut}
           className="rounded-lg p-2 text-zinc-400 transition-colors hover:bg-zinc-100 hover:text-zinc-600 dark:hover:bg-zinc-800 dark:hover:text-zinc-200"
           title="Sign out"
         >

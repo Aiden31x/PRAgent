@@ -2,6 +2,7 @@ import enum
 from datetime import datetime
 
 from sqlalchemy import (
+    Boolean,
     DateTime,
     Enum,
     ForeignKey,
@@ -59,6 +60,10 @@ class User(Base):
     github_username: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     github_token: Mapped[str] = mapped_column(Text)
     avatar_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    preferred_llm_provider: Mapped[str] = mapped_column(
+        String(50), default="gemini", server_default="gemini"
+    )
+    preferred_llm_model: Mapped[str | None] = mapped_column(String(100), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -95,6 +100,13 @@ class Review(Base):
     critical_count: Mapped[int] = mapped_column(Integer, default=0)
     warning_count: Mapped[int] = mapped_column(Integer, default=0)
     info_count: Mapped[int] = mapped_column(Integer, default=0)
+    github_review_posted: Mapped[bool] = mapped_column(Boolean, default=False)
+    llm_provider: Mapped[str] = mapped_column(
+        String(50), default="gemini", server_default="gemini"
+    )
+    llm_model: Mapped[str] = mapped_column(
+        String(100), default="", server_default=""
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

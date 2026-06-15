@@ -40,8 +40,8 @@ Every response you produce must be EXACTLY ONE of these:
 2. A THOUGHT message — plain text starting with "THOUGHT:" where you reason \
    about what you have observed and plan your next step.
 
-3. A REVIEW_COMPLETE message — the final output with your structured JSON \
-   findings. Use this ONLY when you are done reviewing.
+3. A ---REVIEW_COMPLETE--- message — the final output with your structured \
+   JSON findings. Use this ONLY when you are done reviewing.
 
 Rules:
 - Do NOT write tool calls as text. Use the function-calling interface.
@@ -51,7 +51,7 @@ Rules:
   show your analysis.
 - You have a MAXIMUM of 15 iterations. Budget them wisely.
 - If you reach iteration 12+ without finishing, wrap up and output \
-  REVIEW_COMPLETE with whatever findings you have so far.
+  ---REVIEW_COMPLETE--- with whatever findings you have so far.
 
 === C. MANDATORY OPENING SEQUENCE ===
 
@@ -109,7 +109,7 @@ Turn 4: You send a text message:
   is a SQL injection vulnerability. I have enough context to produce my \
   review.
 
-Turn 5: You send REVIEW_COMPLETE followed by the JSON object.
+Turn 5: You send ---REVIEW_COMPLETE--- followed by the JSON object.
 
 --- EXAMPLE END ---
 
@@ -173,10 +173,12 @@ info — The issue:
 
 === G. OUTPUT FORMAT ===
 
-When you have finished your review, output the marker REVIEW_COMPLETE on its
-own line, followed by a single JSON object with this exact schema:
+When you have finished your review, output the marker ---REVIEW_COMPLETE--- \
+on its own line, followed by a single JSON object with this exact schema. \
+Do NOT include any code snippets, explanations, or other text between the \
+marker and the JSON. The very next character after the marker line must be {{.
 
-REVIEW_COMPLETE
+---REVIEW_COMPLETE---
 {{
   "summary": "One paragraph plain-English summary of the PR and your findings.",
   "pr_type": "feature|bugfix|refactor|dependency_update|config_change|docs|mixed",
@@ -239,7 +241,7 @@ Do NOT open issues for warning or info findings. Ever.
    call in this session, you do not know what it contains. Say so and move on.
 6. Do NOT invent security vulnerabilities that require assumptions about
    code you haven't read. Verify before flagging.
-7. Do NOT produce REVIEW_COMPLETE until you have read the diff and
+7. Do NOT produce ---REVIEW_COMPLETE--- until you have read the diff and
    investigated at least the highest-risk changed files.
 
 === J. EDGE CASE HANDLING ===
@@ -257,20 +259,23 @@ Do NOT open issues for warning or info findings. Ever.
   State in your first THOUGHT which files you are skipping and why.
 
 • If the diff is empty or trivially small (< 5 lines, only docs/comments)
-  → produce REVIEW_COMPLETE with an empty comments array and a summary
+  → produce ---REVIEW_COMPLETE--- with an empty comments array and a summary
   noting the PR is low-risk.
 
 === FINAL REMINDER ===
 
 CRITICAL: When you are ready to finish, your message MUST begin with the \
-exact string REVIEW_COMPLETE on its own line, followed immediately by a \
-raw JSON object. No markdown fences. No explanation. No trailing text. \
-No placeholder values like "String(...)". Every value must be a real \
-string, number, or boolean.
+exact string ---REVIEW_COMPLETE--- on its own line, followed immediately \
+by a raw JSON object on the next line. No markdown fences. No explanation. \
+No code snippets. No trailing text. No placeholder values like \
+"String(...)". Every value must be a real string, number, or boolean.
+
+Do NOT put any code from the PR between the marker and the JSON. The JSON \
+is YOUR review output, not code you are quoting.
 
 Minimal valid example (for a clean PR with no issues):
 
-REVIEW_COMPLETE
+---REVIEW_COMPLETE---
 {{"summary": "This PR adds a utility function. No issues found.", "pr_type": "feature", "stats": {{"critical": 0, "warning": 0, "info": 0}}, "comments": [], "issues_to_open": []}}
 
 === BEGIN ===
@@ -337,25 +342,24 @@ def build_first_user_message(
 
 
 RETRY_MALFORMED_JSON = """\
-Your last output after REVIEW_COMPLETE was not valid JSON. \
-Output REVIEW_COMPLETE followed by the raw JSON object. No markdown fences, \
-no explanation, no placeholder values like String(...). Every value must be a \
-real string, integer, or boolean.
+Your last output was not valid JSON. You included code from the PR instead \
+of your review JSON. Output ---REVIEW_COMPLETE--- followed by ONLY the raw \
+JSON object with your review findings. No code snippets, no markdown fences, \
+no explanation, no placeholder values. The JSON must have these keys: \
+summary, pr_type, stats, comments, issues_to_open.
 
-Here is the exact structure. Fill in real values from your review:
-
-REVIEW_COMPLETE
+---REVIEW_COMPLETE---
 {"summary": "...", "pr_type": "feature", "stats": {"critical": 0, "warning": 0, "info": 0}, "comments": [], "issues_to_open": []}
 """
 
 FORCE_CONCLUDE = """\
-You have reached the iteration limit. You MUST output REVIEW_COMPLETE now \
+You have reached the iteration limit. Output ---REVIEW_COMPLETE--- now \
 with your findings so far. If you found no issues, use an empty comments \
-array. Output REVIEW_COMPLETE followed by the raw JSON immediately. No \
-markdown fences, no explanation, no placeholders.
+array. Output ---REVIEW_COMPLETE--- followed by ONLY the raw JSON. No \
+code snippets, no markdown fences, no explanation.
 
-REVIEW_COMPLETE
-{"summary": "...", "pr_type": "...", "stats": {"critical": 0, "warning": 0, "info": 0}, "comments": [...], "issues_to_open": [...]}
+---REVIEW_COMPLETE---
+{"summary": "...", "pr_type": "...", "stats": {"critical": 0, "warning": 0, "info": 0}, "comments": [], "issues_to_open": []}
 
 Replace the ... with real values. Output nothing else.
 """

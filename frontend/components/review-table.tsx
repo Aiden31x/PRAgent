@@ -70,7 +70,7 @@ export function ReviewTable({ reviews, showAll }: ReviewTableProps) {
                 </Link>
               </td>
               <td className="px-5 py-4 text-zinc-500 dark:text-zinc-400">
-                {r.repo?.full_name ?? "—"}
+                {r.repo_full_name ?? "—"}
               </td>
               <td className="px-5 py-4">
                 <StatusBadge status={r.status} />

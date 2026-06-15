@@ -1,8 +1,12 @@
 """ReAct agent orchestrator — the core of PRAgent.
 
-Drives a Gemini 2.5 Flash model through a Reason → Act → Observe loop,
-routing tool calls through the MCP client to the GitHub MCP server, and
-persisting the final structured review to the database.
+Drives an LLM through a Reason → Act → Observe loop, routing tool calls
+through the MCP client to the GitHub MCP server, and persisting the final
+structured review to the database.
+
+The LLM is swappable at call time via the provider/model parameters.
+Provider-specific SDK code lives in app/agent/llm/; the loop itself is
+fully provider-agnostic.
 """
 
 from __future__ import annotations
@@ -12,10 +16,10 @@ import logging
 import re
 from typing import Any
 
-from google import genai
-from google.genai import types as genai_types
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agent.llm.base import ToolResult
+from app.agent.llm.factory import get_provider
 from app.agent.prompts import (
     FORCE_CONCLUDE,
     RETRY_MALFORMED_JSON,
@@ -24,7 +28,7 @@ from app.agent.prompts import (
 )
 from app.agent.schemas import ReviewOutput
 from app.config import settings
-from app.mcp.bridge import mcp_tools_to_gemini_declarations
+from app.mcp.bridge import mcp_tools_to_declarations
 from app.mcp.client import MCPClientManager
 from app.models import (
     AgentEventType,
@@ -32,6 +36,7 @@ from app.models import (
     Review,
     ReviewComment,
     ReviewStatus,
+    Severity,
 )
 
 logger = logging.getLogger(__name__)
@@ -56,39 +61,39 @@ async def run_review(
     github_token: str,
     review_id: int,
     db: AsyncSession,
+    provider: str = "gemini",
+    model: str | None = None,
 ) -> int:
     """Run a full agentic PR review and persist results.
+
+    Parameters
+    ----------
+    provider:
+        LLM provider name — ``"gemini"`` or ``"claude"``.
+    model:
+        Specific model string.  Defaults to the configured default for
+        the chosen provider when not supplied.
 
     Returns the review_id on success.
     """
     owner, repo = repo_full_name.split("/", 1)
-    client = MCPClientManager()
+    mcp_client = MCPClientManager()
+    resolved_model = model or settings.default_model_for(provider)
+    llm = get_provider(provider, resolved_model)
 
     try:
         # ---- 1. SETUP ------------------------------------------------
         await _update_review_status(db, review_id, ReviewStatus.REVIEWING)
 
         logger.info("[review=%d] Connecting to GitHub MCP server…", review_id)
-        await client.connect(github_token)
+        await mcp_client.connect(github_token)
 
-        mcp_tools = await client.list_tools()
-        gemini_decls = mcp_tools_to_gemini_declarations(mcp_tools)
+        mcp_tools = await mcp_client.list_tools()
+        tool_dicts = mcp_tools_to_declarations(mcp_tools)
         logger.info(
-            "[review=%d] %d Gemini tool declarations ready",
-            review_id,
-            len(gemini_decls),
+            "[review=%d] %d tool declarations ready (provider=%s model=%s)",
+            review_id, len(tool_dicts), provider, resolved_model,
         )
-
-        gemini = genai.Client(api_key=settings.gemini_api_key)
-
-        tool_declarations = [
-            genai_types.FunctionDeclaration(
-                name=d["name"],
-                description=d["description"],
-                parameters_json_schema=d["parameters"],
-            )
-            for d in gemini_decls
-        ]
 
         first_user_msg = build_first_user_message(
             owner=owner,
@@ -101,102 +106,62 @@ async def run_review(
             changed_files=changed_files,
         )
 
-        contents: list[genai_types.Content] = [
-            genai_types.Content(role="user", parts=[genai_types.Part(text=first_user_msg)]),
-        ]
-
-        config = genai_types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            tools=[genai_types.Tool(function_declarations=tool_declarations)],
-            tool_config=genai_types.ToolConfig(
-                function_calling_config=genai_types.FunctionCallingConfig(
-                    mode="VALIDATED",
-                ),
-            ),
-        )
-
-        declared_names = {d["name"] for d in gemini_decls}
-
-        json_only_config = genai_types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-        )
-
         # ---- 2. REACT LOOP -------------------------------------------
         review_output: ReviewOutput | None = None
+
+        response = await llm.start(
+            system_prompt=SYSTEM_PROMPT,
+            tools=tool_dicts,
+            first_message=first_user_msg,
+        )
 
         for iteration in range(1, MAX_ITERATIONS + 1):
             logger.info("[review=%d] Iteration %d/%d", review_id, iteration, MAX_ITERATIONS)
 
-            response = await gemini.aio.models.generate_content(
-                model=settings.gemini_model,
-                contents=contents,
-                config=config,
-            )
+            # -- Case A: tool calls from model --------------------------
+            if response.has_tool_calls:
+                tool_results: list[ToolResult] = []
 
-            # -- Case A: function call(s) from model --------------------
-            if response.function_calls:
-                model_content = response.candidates[0].content
-                contents.append(model_content)
-
-                fn_response_parts: list[genai_types.Part] = []
-
-                for fc in response.function_calls:
-                    tool_name = fc.name
-                    tool_args = fc.args or {}
-
+                for tc in response.tool_calls:
                     logger.info(
                         "[review=%d] Tool call: %s(%s)",
-                        review_id, tool_name, _trunc(str(tool_args)),
+                        review_id, tc.name, _trunc(str(tc.args)),
                     )
                     await _log_agent_event(
                         db, review_id, AgentEventType.FETCHING,
-                        f"Calling {tool_name}",
+                        f"Calling {tc.name}",
                     )
 
-                    if tool_name not in declared_names:
+                    if tc.name not in llm.tool_names:
                         logger.warning(
                             "[review=%d] Hallucinated tool '%s' — not in declared set",
-                            review_id, tool_name,
+                            review_id, tc.name,
                         )
                         result_text = (
-                            f"ERROR: Unknown tool '{tool_name}'. "
-                            f"Available tools: {sorted(declared_names)}"
+                            f"ERROR: Unknown tool '{tc.name}'. "
+                            f"Available tools: {sorted(llm.tool_names)}"
                         )
                     else:
                         try:
-                            mcp_result = await client.call_tool(tool_name, tool_args)
+                            mcp_result = await mcp_client.call_tool(tc.name, tc.args)
                             result_text = _extract_mcp_text(mcp_result)
                         except Exception as exc:
                             logger.warning(
                                 "[review=%d] Tool %s failed: %s",
-                                review_id, tool_name, exc,
+                                review_id, tc.name, exc,
                             )
                             result_text = f"ERROR: {exc}"
 
-                    fn_response_parts.append(
-                        genai_types.Part(
-                            function_response=genai_types.FunctionResponse(
-                                name=tool_name,
-                                response={"result": result_text},
-                            )
-                        )
+                    tool_results.append(
+                        ToolResult(call_id=tc.id, name=tc.name, content=result_text)
                     )
 
-                contents.append(
-                    genai_types.Content(role="user", parts=fn_response_parts)
-                )
+                response = await llm.submit_tool_results(tool_results)
                 continue
 
             # -- Case B: text response ----------------------------------
             text = response.text or ""
             block_type = parse_block_type(text)
-
-            contents.append(
-                genai_types.Content(
-                    role="model",
-                    parts=[genai_types.Part(text=text)],
-                )
-            )
 
             if block_type == "REVIEW_COMPLETE":
                 logger.info("[review=%d] Agent signalled REVIEW_COMPLETE", review_id)
@@ -205,25 +170,8 @@ async def run_review(
                 review_output = _try_parse_review(text)
                 if review_output is None:
                     logger.warning("[review=%d] Malformed JSON — requesting retry (no tools)", review_id)
-                    contents.append(
-                        genai_types.Content(
-                            role="user",
-                            parts=[genai_types.Part(text=RETRY_MALFORMED_JSON)],
-                        )
-                    )
-                    retry_resp = await gemini.aio.models.generate_content(
-                        model=settings.gemini_model,
-                        contents=contents,
-                        config=json_only_config,
-                    )
-                    retry_text = retry_resp.text or ""
-                    contents.append(
-                        genai_types.Content(
-                            role="model",
-                            parts=[genai_types.Part(text=retry_text)],
-                        )
-                    )
-                    review_output = _try_parse_review(retry_text)
+                    retry_resp = await llm.generate_no_tools(RETRY_MALFORMED_JSON)
+                    review_output = _try_parse_review(retry_resp.text or "")
 
                 break
 
@@ -240,22 +188,13 @@ async def run_review(
                     db, review_id, AgentEventType.THINKING, text[:200],
                 )
 
+            response = await llm.continue_after_thought()
+
         # -- Force conclude if loop exhausted without REVIEW_COMPLETE ---
         if review_output is None:
             logger.warning("[review=%d] Max iterations reached — forcing conclude (no tools)", review_id)
-            contents.append(
-                genai_types.Content(
-                    role="user",
-                    parts=[genai_types.Part(text=FORCE_CONCLUDE)],
-                )
-            )
-            force_resp = await gemini.aio.models.generate_content(
-                model=settings.gemini_model,
-                contents=contents,
-                config=json_only_config,
-            )
-            force_text = force_resp.text or ""
-            review_output = _try_parse_review(force_text)
+            force_resp = await llm.generate_no_tools(FORCE_CONCLUDE)
+            review_output = _try_parse_review(force_resp.text or "")
 
         # ---- 3. PERSIST RESULTS --------------------------------------
         if review_output is not None:
@@ -270,6 +209,24 @@ async def run_review(
                 review_output.stats.warning,
                 review_output.stats.info,
             )
+
+            # ---- 4. POST TO GITHUB (best-effort) --------------------
+            try:
+                saved_comments = await _load_review_comments(db, review_id)
+                if saved_comments:
+                    await post_review_to_github(
+                        review_id=review_id,
+                        repo_full_name=repo_full_name,
+                        pr_number=pr_number,
+                        comments=saved_comments,
+                        github_token=github_token,
+                        db=db,
+                    )
+            except Exception:
+                logger.exception(
+                    "[review=%d] GitHub posting failed — findings are saved in DB",
+                    review_id,
+                )
         else:
             logger.error("[review=%d] No valid review output produced", review_id)
             await _update_review_status(db, review_id, ReviewStatus.FAILED)
@@ -280,8 +237,8 @@ async def run_review(
         raise
 
     finally:
-        if client.is_connected:
-            await client.disconnect()
+        if mcp_client.is_connected:
+            await mcp_client.disconnect()
 
     return review_id
 
@@ -291,67 +248,89 @@ async def run_review(
 # ------------------------------------------------------------------
 
 
+REVIEW_MARKER = "---REVIEW_COMPLETE---"
+
+
 def parse_block_type(text: str) -> str:
     """Classify a model text response into REVIEW_COMPLETE, THOUGHT, or UNKNOWN.
 
-    Checks REVIEW_COMPLETE first (it may appear alongside a THOUGHT preamble).
+    Uses the distinctive ---REVIEW_COMPLETE--- marker to avoid false positives
+    from code snippets that happen to contain "REVIEW_COMPLETE".
     """
-    upper = text.upper()
-    if "REVIEW_COMPLETE" in upper:
+    if REVIEW_MARKER in text:
         return "REVIEW_COMPLETE"
     if re.search(r"^THOUGHT\s*:", text, re.IGNORECASE | re.MULTILINE):
         return "THOUGHT"
     return "UNKNOWN"
 
 
+REQUIRED_REVIEW_KEYS = {"summary", "comments"}
+
+
 def extract_review_json(text: str) -> dict[str, Any] | None:
-    """Extract the JSON object following a REVIEW_COMPLETE marker.
+    """Extract the JSON object following the ---REVIEW_COMPLETE--- marker.
 
     Handles:
     - Raw JSON after the marker
     - JSON wrapped in ```json ... ``` fences
-    - Leading/trailing whitespace and text around the JSON
+    - Multiple { } blocks (skips non-review objects like code snippets)
     """
-    # Find everything after the REVIEW_COMPLETE marker
-    pattern = re.compile(r"REVIEW_COMPLETE\s*", re.IGNORECASE)
-    match = pattern.search(text)
-    if not match:
+    idx = text.find(REVIEW_MARKER)
+    if idx == -1:
         return None
 
-    after_marker = text[match.end():]
+    after_marker = text[idx + len(REVIEW_MARKER):]
 
     # Strip markdown fences if present
     fence_pattern = re.compile(r"```(?:json)?\s*\n?(.*?)\n?\s*```", re.DOTALL)
     fence_match = fence_pattern.search(after_marker)
     if fence_match:
-        json_str = fence_match.group(1)
-    else:
-        json_str = after_marker
+        after_marker = fence_match.group(1)
 
-    # Find the outermost JSON object
-    brace_start = json_str.find("{")
-    if brace_start == -1:
-        logger.error("No JSON object found after REVIEW_COMPLETE. Raw text:\n%s", after_marker[:500])
-        return None
+    # Try each top-level { } block until we find one that parses as valid
+    # review JSON (has "summary" and "comments" keys). This skips code
+    # snippets the model may have included before the actual JSON.
+    search_from = 0
+    while True:
+        brace_start = after_marker.find("{", search_from)
+        if brace_start == -1:
+            logger.error(
+                "No valid review JSON found after %s. Raw text:\n%s",
+                REVIEW_MARKER, after_marker[:500],
+            )
+            return None
 
-    depth = 0
-    for i, ch in enumerate(json_str[brace_start:], start=brace_start):
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                json_str = json_str[brace_start : i + 1]
-                break
-    else:
-        logger.error("Unbalanced braces in JSON. Raw text:\n%s", json_str[:500])
-        return None
+        depth = 0
+        end = -1
+        for i, ch in enumerate(after_marker[brace_start:], start=brace_start):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
 
-    try:
-        return json.loads(json_str)
-    except json.JSONDecodeError as exc:
-        logger.error("JSON parse failed: %s\nRaw:\n%s", exc, json_str[:500])
-        return None
+        if end == -1:
+            logger.error("Unbalanced braces in JSON. Raw text:\n%s", after_marker[:500])
+            return None
+
+        candidate = after_marker[brace_start : end + 1]
+
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            search_from = end + 1
+            continue
+
+        if isinstance(parsed, dict) and REQUIRED_REVIEW_KEYS.issubset(parsed.keys()):
+            return parsed
+
+        logger.debug(
+            "Skipping non-review JSON object: keys=%s",
+            list(parsed.keys()) if isinstance(parsed, dict) else type(parsed),
+        )
+        search_from = end + 1
 
 
 # ------------------------------------------------------------------
@@ -393,6 +372,18 @@ async def _update_review_status(
         await db.commit()
 
 
+async def _load_review_comments(
+    db: AsyncSession, review_id: int
+) -> list[ReviewComment]:
+    """Load all ReviewComment rows for a given review."""
+    from sqlalchemy import select
+
+    result = await db.execute(
+        select(ReviewComment).where(ReviewComment.review_id == review_id)
+    )
+    return list(result.scalars().all())
+
+
 async def _log_agent_event(
     db: AsyncSession,
     review_id: int,
@@ -430,3 +421,171 @@ async def _save_review_results(
         db.add(comment)
 
     await db.commit()
+
+
+# ------------------------------------------------------------------
+# Post review to GitHub via MCP
+# ------------------------------------------------------------------
+
+
+async def post_review_to_github(
+    *,
+    review_id: int,
+    repo_full_name: str,
+    pr_number: int,
+    comments: list[ReviewComment],
+    github_token: str,
+    db: AsyncSession,
+) -> None:
+    """Post saved review findings to GitHub as a PR review with inline comments.
+
+    Creates a pending review, attaches inline comments for findings that have
+    valid file_path + line_number, submits the review, and opens GitHub issues
+    for critical findings. Failures here never fail the overall review — the
+    findings are already persisted in the DB.
+    """
+    owner, repo = repo_full_name.split("/", 1)
+    client = MCPClientManager()
+
+    critical = [c for c in comments if c.severity == Severity.CRITICAL]
+    warnings = [c for c in comments if c.severity == Severity.WARNING]
+    infos = [c for c in comments if c.severity == Severity.INFO]
+
+    review_body = (
+        f"**PRAgent automated review** — "
+        f"{len(critical)} critical, {len(warnings)} warnings, {len(infos)} info"
+    )
+
+    try:
+        await client.connect(github_token)
+        await _log_agent_event(db, review_id, AgentEventType.POSTING, "Posting review to GitHub")
+
+        # -- Step 1: Create a pending review on the PR ------------------
+        try:
+            await client.call_tool(
+                "pull_request_review_write",
+                {
+                    "owner": owner,
+                    "repo": repo,
+                    "pullNumber": pr_number,
+                    "method": "create",
+                    "body": review_body,
+                },
+            )
+            logger.info("[review=%d] Created pending GitHub review", review_id)
+        except Exception:
+            logger.exception("[review=%d] Failed to create pending review", review_id)
+
+        # -- Step 2: Add inline comments for each finding ---------------
+        posted_count = 0
+        for c in comments:
+            if not c.file_path or not c.line_number:
+                continue
+
+            body_parts = [f"**[{c.severity.value.upper()}] {c.category.value.replace('_', ' ').title()}**\n"]
+            body_parts.append(c.body)
+            if c.fix_suggestion:
+                body_parts.append(f"\n💡 **Suggested fix:**\n{c.fix_suggestion}")
+            comment_body = "\n".join(body_parts)
+
+            try:
+                await client.call_tool(
+                    "add_comment_to_pending_review",
+                    {
+                        "owner": owner,
+                        "repo": repo,
+                        "pullNumber": pr_number,
+                        "path": c.file_path,
+                        "line": c.line_number,
+                        "body": comment_body,
+                        "subjectType": "LINE",
+                    },
+                )
+                posted_count += 1
+            except Exception:
+                logger.warning(
+                    "[review=%d] Failed to post inline comment on %s:%d — skipping",
+                    review_id, c.file_path, c.line_number,
+                    exc_info=True,
+                )
+
+        logger.info("[review=%d] Posted %d/%d inline comments", review_id, posted_count, len(comments))
+
+        # -- Step 3: Submit the review ----------------------------------
+        submit_event = "REQUEST_CHANGES" if critical else "COMMENT"
+        try:
+            await client.call_tool(
+                "pull_request_review_write",
+                {
+                    "owner": owner,
+                    "repo": repo,
+                    "pullNumber": pr_number,
+                    "method": "submit_pending",
+                    "event": submit_event,
+                    "body": review_body,
+                },
+            )
+            logger.info("[review=%d] Submitted review with event=%s", review_id, submit_event)
+        except Exception:
+            logger.exception("[review=%d] Failed to submit review — trying COMMENT fallback", review_id)
+            try:
+                await client.call_tool(
+                    "pull_request_review_write",
+                    {
+                        "owner": owner,
+                        "repo": repo,
+                        "pullNumber": pr_number,
+                        "method": "submit_pending",
+                        "event": "COMMENT",
+                        "body": review_body,
+                    },
+                )
+            except Exception:
+                logger.exception("[review=%d] Fallback submit also failed", review_id)
+
+        # -- Step 4: Open issues for critical findings ------------------
+        for c in critical:
+            issue_title = f"PRAgent: {c.category.value.replace('_', ' ').title()} issue in {c.file_path}"
+            issue_body = (
+                f"**Severity:** {c.severity.value}\n"
+                f"**File:** `{c.file_path}` (line {c.line_number})\n"
+                f"**PR:** #{pr_number}\n\n"
+                f"### Description\n{c.body}\n"
+            )
+            if c.fix_suggestion:
+                issue_body += f"\n### Suggested Fix\n{c.fix_suggestion}\n"
+
+            try:
+                await client.call_tool(
+                    "issue_write",
+                    {
+                        "owner": owner,
+                        "repo": repo,
+                        "method": "create",
+                        "title": issue_title,
+                        "body": issue_body,
+                        "labels": ["bug", "pr-agent"],
+                    },
+                )
+                logger.info("[review=%d] Opened issue for critical finding in %s", review_id, c.file_path)
+            except Exception:
+                logger.warning(
+                    "[review=%d] Failed to open issue for %s — skipping",
+                    review_id, c.file_path,
+                    exc_info=True,
+                )
+
+        # -- Step 5: Mark as posted in DB -------------------------------
+        review = await db.get(Review, review_id)
+        if review:
+            review.github_review_posted = True
+            await db.commit()
+
+        await _log_agent_event(db, review_id, AgentEventType.DONE, "Posted review to GitHub")
+
+    except Exception:
+        logger.exception("[review=%d] post_review_to_github failed", review_id)
+
+    finally:
+        if client.is_connected:
+            await client.disconnect()

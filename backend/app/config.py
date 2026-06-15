@@ -51,14 +51,34 @@ class Settings(BaseSettings):
     # --- GitHub PAT (used by MCP server) ---
     github_token: str = ""
 
-    # --- Gemini ---
+    # --- LLM providers ---
+    # Gemini
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-2.5-flash"
+    # See https://ai.google.dev/gemini-api/docs/models (Gemini 3.x is current generation)
+    gemini_model: str = "gemini-3-flash-preview"
+
+    # Claude (Anthropic)
+    anthropic_api_key: str = ""
+    # See https://docs.anthropic.com/en/docs/about-claude/models
+    claude_default_model: str = "claude-sonnet-4-6"
+
+    # Which provider to use when no user preference is set
+    default_llm_provider: str = "gemini"
+
+    def default_model_for(self, provider: str) -> str:
+        """Return the configured default model name for a given provider."""
+        if provider == "claude":
+            return self.claude_default_model
+        return self.gemini_model
 
     # --- JWT ---
     jwt_secret: str = "change-me-in-production"
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 60 * 24 * 7  # 1 week
+
+    # --- Webhooks ---
+    webhook_secret: str = "change-me-webhook-secret"
+    webhook_url: str = "http://localhost:8000/webhooks/github"
 
     # --- CORS ---
     frontend_url: str = "http://localhost:3000"
