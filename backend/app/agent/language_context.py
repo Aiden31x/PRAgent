@@ -1,18 +1,20 @@
 """Language-aware context injection for the PR review agent.
 
 Detects the programming languages present in a PR's changed files by file
-extension, then loads the corresponding review checklist(s) from the
-review-knowledge/ directory and returns them as a single string ready to be
-appended to the first user message.
+extension, then returns the corresponding review checklist(s) from an
+in-memory cache populated once at module import time.
 
 Fallback behaviour: if no recognized extensions are found, or if a checklist
-file is missing from disk, an empty string is returned so the agent falls back
-to the core rubric without crashing.
+file was missing from disk at startup, an empty string is returned so the
+agent falls back to the core rubric without crashing.
 """
 
 from __future__ import annotations
 
+import logging
 import pathlib
+
+logger = logging.getLogger(__name__)
 
 # Absolute path to the review-knowledge/ directory (two levels above this file:
 # app/agent/ -> app/ -> backend/ -> review-knowledge/).
@@ -39,6 +41,33 @@ _EXTENSION_MAP: dict[str, str] = {
     ".pyi":  "python",
     ".java": "java",
 }
+
+# ---------------------------------------------------------------------------
+# Module-level cache — loaded once at import time, never re-read from disk.
+# ---------------------------------------------------------------------------
+
+_CHECKLIST_CACHE: dict[str, str] = {}
+
+
+def _build_cache() -> None:
+    """Read each checklist file from disk once and store in ``_CHECKLIST_CACHE``."""
+    for lang in set(_EXTENSION_MAP.values()):
+        path = _KNOWLEDGE_DIR / f"{lang}.md"
+        if path.exists():
+            _CHECKLIST_CACHE[lang] = path.read_text(encoding="utf-8").strip()
+            logger.debug("Loaded language checklist: %s (%d chars)", lang, len(_CHECKLIST_CACHE[lang]))
+        else:
+            logger.warning(
+                "Language checklist not found at %s — that guide will be skipped", path
+            )
+
+
+_build_cache()
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 
 def detect_languages(changed_files: list[str]) -> list[str]:
@@ -72,9 +101,9 @@ def load_language_context(changed_files: list[str]) -> str:
     """Return a formatted string of all relevant language checklists for the
     given changed files, or an empty string if none apply.
 
-    The returned string is safe to append directly to the first user message.
-    Missing checklist files are silently skipped so a misconfigured install
-    does not crash a live review.
+    Reads exclusively from the in-memory ``_CHECKLIST_CACHE`` — no disk I/O
+    on the hot path.  The returned string is safe to append directly to the
+    first user message.
     """
     langs = detect_languages(changed_files)
     if not langs:
@@ -82,9 +111,9 @@ def load_language_context(changed_files: list[str]) -> str:
 
     sections: list[str] = []
     for lang in langs:
-        path = _KNOWLEDGE_DIR / f"{lang}.md"
-        if path.exists():
-            sections.append(path.read_text(encoding="utf-8").strip())
+        content = _CHECKLIST_CACHE.get(lang, "")
+        if content:
+            sections.append(content)
 
     if not sections:
         return ""

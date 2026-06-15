@@ -311,6 +311,7 @@ def build_first_user_message(
     base_branch: str,
     head_branch: str,
     changed_files: list[str],
+    skipped_files_count: int = 0,
     language_context: str = "",
 ) -> str:
     """Build the first user message containing PR-specific context.
@@ -322,6 +323,14 @@ def build_first_user_message(
 
     Parameters
     ----------
+    changed_files:
+        Pre-filtered, pre-capped list of files to display.  Lockfiles,
+        generated artefacts, and excess files are stripped by the orchestrator
+        before this function is called.
+    skipped_files_count:
+        Number of files omitted from ``changed_files`` (filtered + capped).
+        When non-zero, a note is appended to the file list so the agent knows
+        more files exist and can use tool calls to discover them.
     language_context:
         Optional language-specific review checklist produced by
         ``app.agent.language_context.load_language_context``.  When non-empty
@@ -331,11 +340,16 @@ def build_first_user_message(
     if not pr_description or pr_description.strip() == "":
         pr_description = "(no description provided)"
 
-    changed_files_block = (
-        "\n".join(f"  - {f}" for f in changed_files)
-        if changed_files
-        else "  (file list not available — fetch via tool)"
-    )
+    if changed_files:
+        lines = [f"  - {f}" for f in changed_files]
+        if skipped_files_count > 0:
+            lines.append(
+                f"  ... and {skipped_files_count} more files "
+                f"(lockfiles, generated, or vendored — use tool calls to read any you need)"
+            )
+        changed_files_block = "\n".join(lines)
+    else:
+        changed_files_block = "  (file list not available — fetch via tool)"
 
     msg = _FIRST_USER_MESSAGE_TEMPLATE.format(
         owner=owner,
@@ -345,7 +359,7 @@ def build_first_user_message(
         pr_description=pr_description,
         base_branch=base_branch,
         head_branch=head_branch,
-        num_files=len(changed_files),
+        num_files=len(changed_files) + skipped_files_count,
         changed_files_block=changed_files_block,
     )
 
