@@ -319,3 +319,7 @@ Both are O(n). Use `collections.deque` with `appendleft`/`popleft` (both O(1)) i
 - [ ] String building in loops uses `"".join(...)` not `+=`
 - [ ] Membership tests on large collections use `set`, not `list`
 - [ ] Mock assertions in tests are called as methods (not just accessed as attributes)
+
+
+
+thats how we make pragents be tested
