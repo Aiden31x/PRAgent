@@ -122,6 +122,48 @@ The agent loop includes several hard limits to prevent runaway cost and stuck re
 
 ---
 
+## Running with Docker Compose
+
+The fastest way to get PRAgent running locally — one command after filling in your credentials.
+
+### Prerequisites
+
+- Docker Desktop (Mac / Windows) or Docker Engine + Compose plugin (Linux)
+- A [Neon](https://neon.tech) PostgreSQL connection string
+- A GitHub OAuth App, a GitHub PAT, and a Gemini API key (same as manual setup)
+
+### Steps
+
+```bash
+# 1. Clone the repo
+git clone https://github.com/your-username/PRAgent.git
+cd PRAgent
+
+# 2. Create your env file and fill in your credentials
+cp .env.docker.example .env.docker
+
+# 3. Build and start both services
+docker compose up --build
+```
+
+Open [http://localhost:3000](http://localhost:3000).
+
+The backend is available at [http://localhost:8000](http://localhost:8000) (Swagger UI at `/docs`).
+
+> **Note — `NEXT_PUBLIC_API_URL` is baked in at build time.**
+> The frontend Dockerfile passes this as a build arg so the Next.js compiler can inline it into the client bundle. If you need to point the frontend at a different backend URL, change the `NEXT_PUBLIC_API_URL` value under `build.args` in `docker-compose.yml` and rebuild with `docker compose up --build`.
+
+### Troubleshooting
+
+**Docker socket permission denied (Linux only)**
+The backend container mounts `/var/run/docker.sock` to spawn the GitHub MCP server. On Linux hosts the socket is owned by the `docker` group, so the container's process needs to be in that group. If you see a `permission denied` error on startup, add your user to the group and re-login:
+
+```bash
+sudo usermod -aG docker $USER   # then log out and back in
+```
+
+---
+
 ## Getting Started
 
 ### Prerequisites

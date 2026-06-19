@@ -1,0 +1,23 @@
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount the host Docker socket so the backend can spawn the GitHub MCP
+      # server container (docker run ...) without running a nested daemon.
+      - /var/run/docker.sock:/var/run/docker.sock
+    env_file:
+      - .env.docker
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # NEXT_PUBLIC_* variables are inlined at build time by the Next.js
+        # compiler, so this must be a build arg — not just a runtime env var.
+        NEXT_PUBLIC_API_URL: http://localhost:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
