@@ -130,14 +130,17 @@ class ClaudeProvider(LLMProvider):
         return LLMResponse(text=_extract_text(response))
 
     def _prune_previous_tool_results(self) -> None:
-        """Replace old tool-result payloads in history with compact placeholders.
+        """Compact old tool-result payloads in history to save context tokens.
 
         Called at the start of ``submit_tool_results`` so that by the time new
         results are appended, every previous tool_result block in ``_messages``
-        has been replaced with a one-line summary.  The model got the full
-        content when it originally processed the result; the summary preserves
-        traceability without re-sending kilobytes of file content on every
-        subsequent API call.
+        has its content replaced with a short summary.
+
+        IMPORTANT: We keep the ``tool_result`` block structure and
+        ``tool_use_id`` intact.  Claude requires every ``tool_use`` in an
+        assistant message to be answered by a matching ``tool_result`` in the
+        very next user message — replacing the whole message with a plain
+        string breaks that pairing and causes a 400 error.
         """
         for i, msg in enumerate(self._messages):
             if msg["role"] != "user" or not isinstance(msg["content"], list):
@@ -147,21 +150,19 @@ class ClaudeProvider(LLMProvider):
                 for b in msg["content"]
             ):
                 continue
-            summaries: list[str] = []
+            pruned_blocks: list[dict] = []
             for block in msg["content"]:
                 if not (isinstance(block, dict) and block.get("type") == "tool_result"):
+                    pruned_blocks.append(block)
                     continue
                 content = block.get("content", "")
-                length = (
-                    len(content)
-                    if isinstance(content, str)
-                    else len(str(content))
-                )
-                tool_use_id = block.get("tool_use_id", "?")
-                summaries.append(
-                    f"[Tool result {tool_use_id} — {length} chars, already processed]"
-                )
-            self._messages[i] = {"role": "user", "content": " | ".join(summaries)}
+                length = len(content) if isinstance(content, str) else len(str(content))
+                pruned_blocks.append({
+                    "type": "tool_result",
+                    "tool_use_id": block["tool_use_id"],
+                    "content": f"[Result truncated — {length} chars, already processed]",
+                })
+            self._messages[i] = {"role": "user", "content": pruned_blocks}
 
 
 def _extract_text(response: anthropic.types.Message) -> str:

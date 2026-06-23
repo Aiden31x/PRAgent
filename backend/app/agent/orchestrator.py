@@ -46,6 +46,40 @@ logger = logging.getLogger(__name__)
 MAX_ITERATIONS = 15
 
 # ------------------------------------------------------------------
+# In-process pub/sub for SSE streaming
+# Maps review_id → list of subscriber queues.  Each queue receives
+# dicts of the form {"type": "log"|"status"|"done", "data": {...}}.
+# A None sentinel is placed on the queue when the review finishes so
+# SSE generators know to close the connection.
+# ------------------------------------------------------------------
+
+_review_queues: dict[int, list["asyncio.Queue[dict | None]"]] = {}
+
+
+def subscribe_review(review_id: int) -> "asyncio.Queue[dict | None]":
+    """Register a new subscriber queue for a review and return it."""
+    q: asyncio.Queue[dict | None] = asyncio.Queue()
+    _review_queues.setdefault(review_id, []).append(q)
+    return q
+
+
+def unsubscribe_review(review_id: int, q: "asyncio.Queue[dict | None]") -> None:
+    """Remove a subscriber queue; cleans up the registry if empty."""
+    subs = _review_queues.get(review_id, [])
+    try:
+        subs.remove(q)
+    except ValueError:
+        pass
+    if not subs:
+        _review_queues.pop(review_id, None)
+
+
+async def _publish(review_id: int, event: dict | None) -> None:
+    """Push an event (or None sentinel) to all subscribers of a review."""
+    for q in list(_review_queues.get(review_id, [])):
+        await q.put(event)
+
+# ------------------------------------------------------------------
 # Timeout constants — generous dead-man switches, not tight SLOs.
 # These fire only on genuine hangs (dropped connections, service
 # unresponsive) rather than legitimately slow-but-running calls.
@@ -491,6 +525,21 @@ async def _update_review_status(
     if review:
         review.status = status
         await db.commit()
+        await _publish(review_id, {"type": "status", "data": {"status": status.value}})
+        if status in (ReviewStatus.COMPLETED, ReviewStatus.FAILED):
+            await db.refresh(review)
+            await _publish(review_id, {
+                "type": "done",
+                "data": {
+                    "status": status.value,
+                    "total_comments": review.total_comments,
+                    "critical_count": review.critical_count,
+                    "warning_count": review.warning_count,
+                    "info_count": review.info_count,
+                },
+            })
+            # Sentinel: tell all SSE generators to close
+            await _publish(review_id, None)
 
 
 async def _load_review_comments(
@@ -514,6 +563,15 @@ async def _log_agent_event(
     log = AgentLog(review_id=review_id, event_type=event_type, content=content[:2000])
     db.add(log)
     await db.commit()
+    await _publish(review_id, {
+        "type": "log",
+        "data": {
+            "id": log.id,
+            "event_type": event_type.value,
+            "content": log.content,
+            "created_at": log.created_at.isoformat() if log.created_at else "",
+        },
+    })
 
 
 async def _save_review_results(
