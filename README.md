@@ -6,7 +6,7 @@
 
 ## What is PRAgent?
 
-PRAgent is a full-stack web application that **automatically reviews GitHub pull requests** using an AI agent powered by **Google Gemini** and the **GitHub MCP server**. You connect your GitHub repos, and every time a PR is opened or updated, the agent spins up, reads the diff and files, reasons through the changes, and posts structured review comments back to GitHub — including inline code comments and issues for critical findings.
+PRAgent is a full-stack web application that **automatically reviews GitHub pull requests** using an AI agent powered by **Google Gemini** (or **Anthropic Claude**) and the **GitHub MCP server**. You connect your GitHub repos, and every time a PR is opened or updated, the agent spins up, reads the diff and files, reasons through the changes, and posts structured review comments back to GitHub — including inline code comments and issues for critical findings.
 
 No more waiting for a teammate to find time for a review. PRAgent gives every PR an immediate first-pass review with real analysis.
 
@@ -21,10 +21,13 @@ No more waiting for a teammate to find time for a review. PRAgent gives every PR
 - **Retry posting** — if a review ran successfully but failed to post, you can re-post it without re-running the agent
 
 ### AI Review Engine
-- **ReAct-style agent loop** — Gemini reasons step-by-step, calling GitHub MCP tools to read PR metadata, changed files, and diffs before producing findings
-- **Structured findings** — comments are categorized (bug, security, performance, style, etc.) and assigned a severity level (info / warning / critical)
+- **ReAct-style agent loop** — the LLM reasons step-by-step, calling GitHub MCP tools to read PR metadata, changed files, and diffs before producing findings
+- **Multi-provider** — run reviews with Google Gemini or Anthropic Claude; the provider is swappable per-request without changing any agent logic
+- **Language-aware reviews** — the agent detects the programming languages in the PR diff and injects a targeted review checklist before the loop starts, covering language-specific pitfalls the core rubric alone would miss (see [Language-Aware Reviews](#language-aware-reviews))
+- **Structured findings** — comments are categorized (bug, security, performance, error handling, code quality, test coverage) and assigned a severity level (info / warning / critical)
 - **Agent thought stream** — every reasoning step and tool call is logged so you can see exactly how the agent reached its conclusions
 - **Inline suggestions** — where applicable the agent proposes a concrete code fix alongside the comment
+- **Production-hardened** — generous dead-man timeouts, tool-result history pruning, and file-list filtering keep reviews reliable and cost-controlled on large PRs (see [Production Safeguards](#production-safeguards))
 
 ### Dashboard UI
 - **Repo management** — add repos, view registered webhooks, remove repos (webhook is deleted from GitHub too)
@@ -45,10 +48,10 @@ No more waiting for a teammate to find time for a review. PRAgent gives every PR
 |---|---|
 | **Frontend** | Next.js 16, React 19, TypeScript, Tailwind CSS 4, `next-themes`, `lucide-react` |
 | **Backend** | Python, FastAPI, Uvicorn, SQLAlchemy 2 (async), asyncpg, Alembic, Pydantic Settings |
-| **AI / Agent** | Google Gemini (`google-genai`), GitHub MCP server (`ghcr.io/github/github-mcp-server` via Docker) |
+| **AI / Agent** | Google Gemini (`google-genai`), Anthropic Claude (`anthropic`), GitHub MCP server (`ghcr.io/github/github-mcp-server` via Docker) |
 | **Auth** | GitHub OAuth 2.0, JWT (`python-jose`) |
 | **Database** | PostgreSQL (designed for [Neon](https://neon.tech)) |
-| **External** | GitHub REST API, GitHub Webhooks, Google Gemini API, Docker (for MCP server) |
+| **External** | GitHub REST API, GitHub Webhooks, Google Gemini API, Anthropic API, Docker (for MCP server) |
 
 ---
 
@@ -62,7 +65,10 @@ FastAPI Backend ──► PostgreSQL (Users, Repos, Reviews, Comments, Logs)
       │
       ├── GitHub Webhook ──► auto-trigger review on PR open/sync
       │
-      └── Agent Orchestrator (Gemini ReAct loop)
+      └── Agent Orchestrator (ReAct loop)
+                │
+                ├── Language Context ──► review-knowledge/ checklists
+                │     (injected into first user message before loop)
                 │
                 └── GitHub MCP Server (Docker) ──► GitHub REST API
                           reads PR metadata, diffs, files
@@ -72,9 +78,89 @@ FastAPI Backend ──► PostgreSQL (Users, Repos, Reviews, Comments, Logs)
 1. User signs in with GitHub OAuth → backend stores token, issues JWT
 2. User registers a repo → backend creates a GitHub webhook on that repo
 3. PR opened/updated → GitHub POSTs to `/webhooks/github` → backend verifies HMAC signature → background task runs the agent
-4. Agent calls Gemini with PR context → Gemini uses MCP tools to read the diff → produces structured findings
-5. Backend stores findings in Postgres and posts them back to GitHub as a review
-6. User can view all reviews, comments, and agent logs in the dashboard
+4. Orchestrator detects languages in the changed files, loads the relevant review checklist(s), and injects them into the first LLM message
+5. Agent calls the LLM with PR context → LLM uses MCP tools to read the diff → produces structured findings
+6. Backend stores findings in Postgres and posts them back to GitHub as a review
+7. User can view all reviews, comments, and agent logs in the dashboard
+
+---
+
+## Language-Aware Reviews
+
+Before the ReAct loop starts, the orchestrator inspects the file extensions in the PR diff and injects a language-specific review checklist into the first user message alongside the PR metadata. This directs the agent's attention to pitfalls that are easy to miss in a generic review.
+
+### Supported languages
+
+| Extension(s) | Checklist | What it covers |
+|---|---|---|
+| `.tsx`, `.jsx` | React / Next.js / TypeScript | Hooks rules, stale `useEffect` deps & closures, state mutation, `use client` boundary mistakes, React 19 Actions, `any` type, floating promises |
+| `.ts`, `.js`, `.mts`, `.mjs` | TypeScript | `any` creep, unsafe type assertions, floating promises, `forEach(async)`, array index without guard — React-specific items excluded |
+| `.py`, `.pyi` | Python | Mutable defaults, async blocking calls, `CancelledError` re-raise, `__eq__` without `__hash__`, SQLAlchemy lazy-load N+1 in async sessions |
+| `.java` | Java | `Optional.get()` without guard, `@Transactional` on private methods, JPA N+1, `@Data` on entities, thread-safety |
+| Anything else | — | Falls back to the core rubric with no additional context |
+
+A PR touching multiple languages (e.g. `.py` + `.tsx`) gets both relevant checklists concatenated. If a PR has both `.tsx` and `.ts` files, only the React/TS guide is injected since it already covers TypeScript fundamentals.
+
+The checklists live in `backend/review-knowledge/` as plain Markdown files and are loaded into memory once at server startup — no per-request disk I/O.
+
+---
+
+## Production Safeguards
+
+The agent loop includes several hard limits to prevent runaway cost and stuck reviews:
+
+| Safeguard | Behaviour |
+|---|---|
+| **Per-LLM-call timeout** (5 min) | Each Gemini / Claude API call is wrapped in `asyncio.timeout(300)`. Fires only on genuine hung connections, not legitimately slow generations. |
+| **Per-MCP-tool-call timeout** (5 min) | Each GitHub MCP tool call is wrapped in `asyncio.wait_for(..., timeout=300)`. On timeout the agent receives an `ERROR:` result and continues rather than crashing the review. |
+| **Overall review deadline** (25 min) | The entire `run_review` body runs under `asyncio.timeout(1500)`. If the deadline fires, the review is marked `FAILED` and the MCP Docker container is torn down cleanly. |
+| **Tool-result history pruning** | Once the agent moves on to a new round of tool calls, the previous round's raw responses (which can be megabytes of file content) are replaced in the conversation history with one-line summaries. The agent got the full content when it needed it; keeping it in history would re-send it on every subsequent API call. |
+| **Changed-files filtering** | Lockfiles (`package-lock.json`, `yarn.lock`, `*.lock`, `go.sum`, …), minified assets (`.min.js`, `.min.css`), vendored directories (`/vendor/`, `/dist/`, `/build/`, `/__generated__/`), and generated protobuf files (`.pb.go`) are stripped from the file list shown to the agent. The list is also capped at 150 entries; if files are omitted a note is appended so the agent can fetch them via tool calls if needed. |
+| **GitHub issue cap** | At most 3 GitHub Issues are opened per review, regardless of how many critical findings exist. This prevents issue-tracker spam and avoids hitting the GitHub API rate limit on large reviews. |
+| **Gemini output cap** | `max_output_tokens=8192` is set on every Gemini call — comfortably above any real REVIEW_COMPLETE JSON output but finite. |
+| **Single Docker container** | The MCP Docker container spawned for the review loop is reused for posting the results back to GitHub. Only one container is ever alive per review. |
+
+---
+
+## Running with Docker Compose
+
+The fastest way to get PRAgent running locally — one command after filling in your credentials.
+
+### Prerequisites
+
+- Docker Desktop (Mac / Windows) or Docker Engine + Compose plugin (Linux)
+- A [Neon](https://neon.tech) PostgreSQL connection string
+- A GitHub OAuth App, a GitHub PAT, and a Gemini API key (same as manual setup)
+
+### Steps
+
+```bash
+# 1. Clone the repo
+git clone https://github.com/your-username/PRAgent.git
+cd PRAgent
+
+# 2. Create your env file and fill in your credentials
+cp .env.docker.example .env.docker
+
+# 3. Build and start both services
+docker compose up --build
+```
+
+Open [http://localhost:3000](http://localhost:3000).
+
+The backend is available at [http://localhost:8000](http://localhost:8000) (Swagger UI at `/docs`).
+
+> **Note — `NEXT_PUBLIC_API_URL` is baked in at build time.**
+> The frontend Dockerfile passes this as a build arg so the Next.js compiler can inline it into the client bundle. If you need to point the frontend at a different backend URL, change the `NEXT_PUBLIC_API_URL` value under `build.args` in `docker-compose.yml` and rebuild with `docker compose up --build`.
+
+### Troubleshooting
+
+**Docker socket permission denied (Linux only)**
+The backend container mounts `/var/run/docker.sock` to spawn the GitHub MCP server. On Linux hosts the socket is owned by the `docker` group, so the container's process needs to be in that group. If you see a `permission denied` error on startup, add your user to the group and re-login:
+
+```bash
+sudo usermod -aG docker $USER   # then log out and back in
+```
 
 ---
 
@@ -87,7 +173,7 @@ FastAPI Backend ──► PostgreSQL (Users, Repos, Reviews, Comments, Logs)
 - PostgreSQL database (or a [Neon](https://neon.tech) connection string)
 - Docker (required at runtime for the GitHub MCP server)
 - A GitHub OAuth App
-- A Google Gemini API key
+- A Google Gemini API key (and/or an Anthropic API key for Claude)
 
 ### 1. Clone the repo
 
@@ -119,6 +205,7 @@ cp .env.example .env
 | `GITHUB_TOKEN` | GitHub Personal Access Token (used by the MCP server) |
 | `GEMINI_API_KEY` | Google Gemini API key |
 | `GEMINI_MODEL` | Gemini model to use (e.g. `gemini-3-flash-preview`; see [Gemini models](https://ai.google.dev/gemini-api/docs/models)) |
+| `ANTHROPIC_API_KEY` | Anthropic API key (optional — only needed if using Claude) |
 | `JWT_SECRET` | Random secret for signing JWTs |
 | `WEBHOOK_SECRET` | Secret for verifying GitHub webhook payloads |
 | `WEBHOOK_URL` | Public URL for the webhook endpoint (use [smee.io](https://smee.io) for local dev) |
@@ -228,8 +315,18 @@ PRAgent/
 │   │   ├── repos/               # Repo registration + GitHub webhook management
 │   │   ├── reviews/             # Review CRUD endpoints
 │   │   ├── webhooks/            # GitHub webhook handler
-│   │   ├── agent/               # Gemini ReAct orchestrator + prompts + schemas
+│   │   ├── agent/               # ReAct orchestrator, prompts, schemas, LLM providers
+│   │   │   ├── orchestrator.py  # Main review loop + production safeguards
+│   │   │   ├── prompts.py       # System prompt + first-user-message builder
+│   │   │   ├── schemas.py       # Pydantic models for LLM output validation
+│   │   │   ├── language_context.py  # Language detection + checklist injection
+│   │   │   └── llm/             # Provider adapters (Gemini, Claude)
 │   │   └── mcp/                 # GitHub MCP server client + bridge
+│   ├── review-knowledge/        # Per-language review checklists (Markdown)
+│   │   ├── python.md
+│   │   ├── java.md
+│   │   ├── react-ts.md          # React + Next.js + TypeScript
+│   │   └── typescript.md        # TypeScript-only (no React content)
 │   ├── alembic/                 # Database migrations
 │   ├── requirements.txt
 │   └── .env.example
