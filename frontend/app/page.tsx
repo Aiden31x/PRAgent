@@ -104,6 +104,7 @@ export default function DashboardPage() {
   async function handleTriggerReview(pr: PRSummary) {
     if (!selectedRepo) return;
     setTriggeringPr(pr.number);
+    setError("");
     try {
       const result = await apiFetch<TriggerReviewResponse>("/reviews", {
         method: "POST",
@@ -119,10 +120,10 @@ export default function DashboardPage() {
           model: selectedModel || null,
         }),
       });
+      // Navigate immediately — the review page streams live agent activity
       router.push(`/review/${result.review_id}`);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to trigger review");
-    } finally {
       setTriggeringPr(null);
     }
   }
@@ -329,7 +330,10 @@ export default function DashboardPage() {
                         className="ml-3 shrink-0 rounded-lg bg-emerald-600 px-4 py-1.5 text-xs font-medium text-white transition-colors hover:bg-emerald-700 disabled:opacity-50"
                       >
                         {triggeringPr === pr.number ? (
-                          <Loader2 className="h-3 w-3 animate-spin" />
+                          <span className="flex items-center gap-1.5">
+                            <Loader2 className="h-3 w-3 animate-spin" />
+                            Starting…
+                          </span>
                         ) : (
                           "Review"
                         )}

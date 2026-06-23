@@ -34,11 +34,11 @@ No more waiting for a teammate to find time for a review. PRAgent gives every PR
 - **PR browser** — see all open pull requests for a registered repo with changed file names
 - **Review history** — browse all past reviews with their status, comment counts, and per-review detail pages
 - **Comment viewer** — see every comment the agent produced, grouped by file and severity
-- **Log viewer** — inspect the full agent reasoning trace for any review
+- **Live agent stream** — the review detail page connects to a real-time **Server-Sent Events** stream; every reasoning step and tool call appears the moment it is logged — no page refresh required
 - **Dark / light mode** — theme toggle powered by `next-themes`
 
 ### Manual Reviews
-- Trigger a review on any PR on-demand from the dashboard without waiting for a webhook event
+- Trigger a review on any PR on-demand from the dashboard — the backend starts immediately, the UI navigates to the live review page, and you watch the agent work in real time via the SSE stream
 
 ---
 
@@ -65,23 +65,31 @@ FastAPI Backend ──► PostgreSQL (Users, Repos, Reviews, Comments, Logs)
       │
       ├── GitHub Webhook ──► auto-trigger review on PR open/sync
       │
-      └── Agent Orchestrator (ReAct loop)
-                │
-                ├── Language Context ──► review-knowledge/ checklists
-                │     (injected into first user message before loop)
-                │
-                └── GitHub MCP Server (Docker) ──► GitHub REST API
-                          reads PR metadata, diffs, files
-                          posts review + inline comments + issues
+      ├── POST /reviews ──► creates Review row, returns review_id immediately
+      │         │
+      │         └── BackgroundTask: Agent Orchestrator (ReAct loop)
+      │                   │  publishes events via asyncio.Queue
+      │                   │
+      │                   ├── Language Context ──► review-knowledge/ checklists
+      │                   │     (injected into first user message before loop)
+      │                   │
+      │                   └── GitHub MCP Server (Docker) ──► GitHub REST API
+      │                             reads PR metadata, diffs, files
+      │                             posts review + inline comments + issues
+      │
+      └── GET /reviews/{id}/stream ──► SSE stream (text/event-stream)
+                Browser receives live log / status / done events
 ```
 
 1. User signs in with GitHub OAuth → backend stores token, issues JWT
 2. User registers a repo → backend creates a GitHub webhook on that repo
-3. PR opened/updated → GitHub POSTs to `/webhooks/github` → backend verifies HMAC signature → background task runs the agent
-4. Orchestrator detects languages in the changed files, loads the relevant review checklist(s), and injects them into the first LLM message
-5. Agent calls the LLM with PR context → LLM uses MCP tools to read the diff → produces structured findings
-6. Backend stores findings in Postgres and posts them back to GitHub as a review
-7. User can view all reviews, comments, and agent logs in the dashboard
+3. **Manual trigger**: User clicks **Review** on the dashboard → `POST /reviews` returns the `review_id` in ~100 ms → browser navigates immediately to the review detail page
+4. **Webhook trigger**: PR opened/updated → GitHub POSTs to `/webhooks/github` → backend verifies HMAC signature → background task runs the agent
+5. Review detail page opens a `GET /reviews/{id}/stream` SSE connection — the backend sends a catch-up burst of any logs already written, then pushes `log`, `status`, and `done` events in real time as the agent works
+6. Orchestrator detects languages in the changed files, loads the relevant review checklist(s), and injects them into the first LLM message
+7. Agent calls the LLM with PR context → LLM uses MCP tools to read the diff → produces structured findings
+8. Backend stores findings in Postgres and posts them back to GitHub as a review
+9. The SSE `done` event fires; the frontend fetches the final comment set and populates the findings panel
 
 ---
 
@@ -111,10 +119,11 @@ The agent loop includes several hard limits to prevent runaway cost and stuck re
 
 | Safeguard | Behaviour |
 |---|---|
+| **Non-blocking review trigger** | `POST /reviews` commits the review row and launches a `BackgroundTask` — the HTTP response returns in ~100 ms regardless of how long the agent takes. The frontend connects to the SSE stream for live progress. |
 | **Per-LLM-call timeout** (5 min) | Each Gemini / Claude API call is wrapped in `asyncio.timeout(300)`. Fires only on genuine hung connections, not legitimately slow generations. |
 | **Per-MCP-tool-call timeout** (5 min) | Each GitHub MCP tool call is wrapped in `asyncio.wait_for(..., timeout=300)`. On timeout the agent receives an `ERROR:` result and continues rather than crashing the review. |
 | **Overall review deadline** (25 min) | The entire `run_review` body runs under `asyncio.timeout(1500)`. If the deadline fires, the review is marked `FAILED` and the MCP Docker container is torn down cleanly. |
-| **Tool-result history pruning** | Once the agent moves on to a new round of tool calls, the previous round's raw responses (which can be megabytes of file content) are replaced in the conversation history with one-line summaries. The agent got the full content when it needed it; keeping it in history would re-send it on every subsequent API call. |
+| **Tool-result history pruning** | Once the agent moves on to a new round of tool calls, the previous round's raw responses (which can be megabytes of file content) are replaced in the conversation history with compact placeholders. The `tool_result` block structure and `tool_use_id` are preserved so the Claude API does not reject the history; only the content is truncated. |
 | **Changed-files filtering** | Lockfiles (`package-lock.json`, `yarn.lock`, `*.lock`, `go.sum`, …), minified assets (`.min.js`, `.min.css`), vendored directories (`/vendor/`, `/dist/`, `/build/`, `/__generated__/`), and generated protobuf files (`.pb.go`) are stripped from the file list shown to the agent. The list is also capped at 150 entries; if files are omitted a note is appended so the agent can fetch them via tool calls if needed. |
 | **GitHub issue cap** | At most 3 GitHub Issues are opened per review, regardless of how many critical findings exist. This prevents issue-tracker spam and avoids hitting the GitHub API rate limit on large reviews. |
 | **Gemini output cap** | `max_output_tokens=8192` is set on every Gemini call — comfortably above any real REVIEW_COMPLETE JSON output but finite. |
@@ -283,7 +292,8 @@ The backend exposes an interactive **Swagger UI** at [`http://localhost:8000/doc
 | `GET` | `/reviews` | List all reviews |
 | `GET` | `/reviews/{review_id}` | Review detail |
 | `GET` | `/reviews/{review_id}/comments` | Review comments |
-| `GET` | `/reviews/{review_id}/logs` | Agent reasoning logs |
+| `GET` | `/reviews/{review_id}/logs` | Agent reasoning logs (full history, REST) |
+| `GET` | `/reviews/{review_id}/stream` | Live SSE stream of agent events (`log` / `status` / `done`) |
 | `POST` | `/reviews/{review_id}/post-to-github` | Re-post a completed review to GitHub |
 | `POST` | `/webhooks/github` | GitHub webhook receiver |
 

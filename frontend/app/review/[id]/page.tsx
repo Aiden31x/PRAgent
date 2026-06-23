@@ -6,7 +6,7 @@ import { Header } from "@/components/header";
 import { AgentStream } from "@/components/agent-stream";
 import { ReviewPanel } from "@/components/review-panel";
 import { StatusBadge } from "@/components/status-badge";
-import { apiFetch } from "@/lib/api";
+import { apiFetch, streamReview } from "@/lib/api";
 import type { Review, AgentLog, ReviewComment } from "@/lib/types";
 import { Loader2 } from "lucide-react";
 
@@ -18,49 +18,83 @@ export default function ReviewDetailPage() {
   const [logs, setLogs] = useState<AgentLog[]>([]);
   const [comments, setComments] = useState<ReviewComment[]>([]);
   const [error, setError] = useState("");
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const cleanupRef = useRef<(() => void) | null>(null);
 
   const isLive = review?.status === "pending" || review?.status === "reviewing";
 
-  const fetchData = useCallback(async () => {
+  /** Fetch the final review state + comments once the stream says we're done. */
+  const fetchFinalState = useCallback(async () => {
     try {
-      const [reviewData, logsData, commentsData] = await Promise.all([
+      const [reviewData, commentsData] = await Promise.all([
         apiFetch<Review>(`/reviews/${id}`),
-        apiFetch<AgentLog[]>(`/reviews/${id}/logs`),
         apiFetch<ReviewComment[]>(`/reviews/${id}/comments`),
       ]);
       setReview(reviewData);
-      setLogs(logsData);
       setComments(commentsData);
-      setError("");
-      return reviewData;
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to load review");
-      return null;
+    } catch {
+      // non-fatal — review header already shows status from SSE
     }
   }, [id]);
 
   useEffect(() => {
-    fetchData();
-  }, [fetchData]);
+    // 1. Load initial state so we can render something while stream connects
+    apiFetch<Review>(`/reviews/${id}`)
+      .then((r) => setReview(r))
+      .catch((e) => setError(e instanceof Error ? e.message : "Failed to load review"));
 
-  useEffect(() => {
-    if (!isLive) {
-      if (pollRef.current) clearInterval(pollRef.current);
-      return;
-    }
+    // 2. Open SSE stream — handles both live and catch-up (already finished) reviews
+    const cleanup = streamReview(id, {
+      onLog(data) {
+        setLogs((prev) => {
+          if (prev.some((l) => l.id === data.id)) return prev;
+          return [...prev, { ...data, event_type: data.event_type as AgentLog["event_type"] }];
+        });
+      },
+      onStatus(data) {
+        setReview((prev) =>
+          prev ? { ...prev, status: data.status as Review["status"] } : prev
+        );
+      },
+      onDone(data) {
+        setReview((prev) =>
+          prev
+            ? {
+                ...prev,
+                status: data.status as Review["status"],
+                total_comments: data.total_comments,
+                critical_count: data.critical_count,
+                warning_count: data.warning_count,
+                info_count: data.info_count,
+              }
+            : prev
+        );
+        fetchFinalState(); // load inline comments that appear in the right panel
+      },
+      onError(err) {
+        // SSE failed — fall back to a one-time REST poll so UI isn't broken
+        console.warn("SSE error, falling back to REST poll:", err.message);
+        const interval = setInterval(async () => {
+          try {
+            const [r, c] = await Promise.all([
+              apiFetch<Review>(`/reviews/${id}`),
+              apiFetch<ReviewComment[]>(`/reviews/${id}/comments`),
+            ]);
+            const logsData = await apiFetch<AgentLog[]>(`/reviews/${id}/logs`);
+            setReview(r);
+            setComments(c);
+            setLogs(logsData);
+            if (r.status !== "pending" && r.status !== "reviewing") {
+              clearInterval(interval);
+            }
+          } catch {/* ignore */}
+        }, 3000);
+        cleanupRef.current = () => clearInterval(interval);
+      },
+    });
 
-    pollRef.current = setInterval(async () => {
-      const data = await fetchData();
-      if (data && data.status !== "pending" && data.status !== "reviewing") {
-        if (pollRef.current) clearInterval(pollRef.current);
-      }
-    }, 3000);
-
-    return () => {
-      if (pollRef.current) clearInterval(pollRef.current);
-    };
-  }, [isLive, fetchData]);
+    cleanupRef.current = cleanup;
+    return () => cleanupRef.current?.();
+  }, [id, fetchFinalState]);
 
   if (error && !review) {
     return (

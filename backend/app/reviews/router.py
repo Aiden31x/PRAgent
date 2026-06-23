@@ -2,18 +2,27 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
+from collections.abc import AsyncGenerator
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.agent.orchestrator import post_review_to_github, run_review
+from app.agent.orchestrator import (
+    post_review_to_github,
+    run_review,
+    subscribe_review,
+    unsubscribe_review,
+)
 from app.auth.dependencies import get_current_user
 from app.config import settings
-from app.database import get_db
+from app.database import async_session, get_db
 from app.models import AgentLog, Repo, Review, ReviewComment, ReviewStatus, User
 
 logger = logging.getLogger(__name__)
@@ -78,13 +87,49 @@ class ReviewDetailResponse(BaseModel):
 # ------------------------------------------------------------------
 
 
+async def _run_review_background(
+    *,
+    review_id: int,
+    repo_full_name: str,
+    pr_number: int,
+    pr_title: str,
+    pr_description: str,
+    base_branch: str,
+    head_branch: str,
+    changed_files: list[str],
+    github_token: str,
+    provider: str,
+    model: str,
+) -> None:
+    """Run a review in a background task with its own DB session."""
+    async with async_session() as db:
+        try:
+            await run_review(
+                repo_full_name=repo_full_name,
+                pr_number=pr_number,
+                pr_title=pr_title,
+                pr_description=pr_description,
+                base_branch=base_branch,
+                head_branch=head_branch,
+                changed_files=changed_files,
+                github_token=github_token,
+                review_id=review_id,
+                db=db,
+                provider=provider,
+                model=model,
+            )
+        except Exception:
+            logger.exception("Background review %d failed", review_id)
+
+
 @router.post("", response_model=TriggerReviewResponse)
 async def trigger_review(
     body: TriggerReviewRequest,
+    background_tasks: BackgroundTasks,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> TriggerReviewResponse:
-    """Trigger a new PR review using the authenticated user's GitHub token."""
+    """Trigger a new PR review; returns immediately and runs the agent in the background."""
     # Verify the repo belongs to this user
     repo = await db.get(Repo, body.repo_id)
     if repo is None or repo.user_id != user.id:
@@ -111,7 +156,8 @@ async def trigger_review(
         llm_model=resolved_model,
     )
     db.add(review)
-    await db.flush()
+    await db.commit()
+    await db.refresh(review)
 
     logger.info(
         "User %s triggered review %d for %s #%d (provider=%s model=%s)",
@@ -119,7 +165,9 @@ async def trigger_review(
         resolved_provider, resolved_model,
     )
 
-    await run_review(
+    background_tasks.add_task(
+        _run_review_background,
+        review_id=review.id,
         repo_full_name=repo.full_name,
         pr_number=body.pr_number,
         pr_title=body.pr_title,
@@ -128,18 +176,14 @@ async def trigger_review(
         head_branch=body.head_branch,
         changed_files=body.changed_files,
         github_token=user.github_token,
-        review_id=review.id,
-        db=db,
         provider=resolved_provider,
         model=resolved_model,
     )
 
-    await db.refresh(review)
-
     return TriggerReviewResponse(
         review_id=review.id,
         status=review.status.value,
-        findings_count=review.total_comments,
+        findings_count=0,
         llm_provider=resolved_provider,
         llm_model=resolved_model,
     )
@@ -285,6 +329,107 @@ async def get_review_logs(
         )
         for log in logs_result.scalars().all()
     ]
+
+
+@router.get("/{review_id}/stream")
+async def stream_review_events(
+    review_id: int,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> StreamingResponse:
+    """Stream live agent events for a review as Server-Sent Events.
+
+    Sends a catch-up burst of all existing log entries, then streams new
+    events in real time until the review finishes or the client disconnects.
+
+    Event types emitted:
+    - ``log``    — new AgentLog row  (id, event_type, content, created_at)
+    - ``status`` — review status changed  (status)
+    - ``done``   — terminal event with final stats; client should close
+    """
+    # Auth: verify review belongs to this user
+    stmt = (
+        select(Review)
+        .join(Repo)
+        .where(Review.id == review_id, Repo.user_id == user.id)
+    )
+    result = await db.execute(stmt)
+    review = result.scalar_one_or_none()
+    if review is None:
+        raise HTTPException(status_code=404, detail="Review not found")
+
+    async def _event_generator() -> AsyncGenerator[str, None]:
+        sent_ids: set[int] = set()
+
+        # Subscribe BEFORE fetching catch-up so we don't miss events that
+        # arrive between the DB read and the queue subscription.
+        queue = subscribe_review(review_id)
+        try:
+            # Fetch and emit all existing logs (catch-up)
+            logs_result = await db.execute(
+                select(AgentLog)
+                .where(AgentLog.review_id == review_id)
+                .order_by(AgentLog.id)
+            )
+            for log in logs_result.scalars().all():
+                sent_ids.add(log.id)
+                payload = json.dumps({
+                    "id": log.id,
+                    "event_type": log.event_type.value,
+                    "content": log.content,
+                    "created_at": log.created_at.isoformat() if log.created_at else "",
+                })
+                yield f"event: log\ndata: {payload}\n\n"
+
+            # Emit current status
+            await db.refresh(review)
+            yield f"event: status\ndata: {json.dumps({'status': review.status.value})}\n\n"
+
+            # If already finished, send done and close
+            if review.status in (ReviewStatus.COMPLETED, ReviewStatus.FAILED):
+                yield f"event: done\ndata: {json.dumps({'status': review.status.value, 'total_comments': review.total_comments, 'critical_count': review.critical_count, 'warning_count': review.warning_count, 'info_count': review.info_count})}\n\n"
+                return
+
+            # Stream live events from the in-process queue
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=20.0)
+                except asyncio.TimeoutError:
+                    # Keepalive comment so the connection stays open through proxies
+                    yield ": keepalive\n\n"
+                    continue
+
+                if event is None:
+                    # Sentinel — review finished, generator can close
+                    break
+
+                event_type = event["type"]
+                event_data = event["data"]
+
+                # Deduplicate log events that were already in the catch-up burst
+                if event_type == "log":
+                    log_id = event_data.get("id")
+                    if log_id in sent_ids:
+                        continue
+                    sent_ids.add(log_id)
+
+                yield f"event: {event_type}\ndata: {json.dumps(event_data)}\n\n"
+
+                if event_type == "done":
+                    break
+
+        finally:
+            unsubscribe_review(review_id, queue)
+
+    return StreamingResponse(
+        _event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @router.post("/{review_id}/post-to-github")
