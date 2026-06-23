@@ -39,3 +39,26 @@ export async function apiFetch<T>(
 export function getLoginUrl(): string {
   return `${API_BASE}/auth/github/login`;
 }
+
+export interface PaginatedReviewsParams {
+  skip?: number;
+  limit?: number;
+  status?: string;
+}
+
+export function buildReviewsUrl(params: PaginatedReviewsParams = {}): string {
+  const query = new URLSearchParams();
+  if (params.skip !== undefined) query.set("skip", String(params.skip));
+  if (params.limit !== undefined) query.set("limit", String(params.limit));
+  if (params.status) query.set("status", params.status);
+  const qs = query.toString();
+  return qs ? `/reviews?${qs}` : "/reviews";
+}
+
+export async function fetchReviews<T>(params: PaginatedReviewsParams = {}): Promise<T> {
+  return apiFetch<T>(buildReviewsUrl(params));
+}
+
+export async function deleteReview(reviewId: number): Promise<void> {
+  await apiFetch<void>(`/reviews/${reviewId}`, { method: "DELETE" });
+}

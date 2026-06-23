@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -149,19 +149,44 @@ async def trigger_review(
 async def list_reviews(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    skip: int = Query(0, ge=0, description="Number of reviews to skip"),
+    limit: int = Query(20, ge=1, le=100, description="Maximum number of reviews to return"),
+    status: str | None = Query(None, description="Filter by review status"),
 ) -> list[ReviewDetailResponse]:
-    """List all reviews for repos owned by the current user."""
+    """List reviews for repos owned by the current user, with optional pagination and status filter."""
     stmt = (
         select(Review)
         .join(Repo)
         .where(Repo.user_id == user.id)
         .options(selectinload(Review.comments), selectinload(Review.repo))
         .order_by(Review.created_at.desc())
+        .offset(skip)
+        .limit(limit)
     )
+
+    if status:
+        stmt = stmt.where(Review.status == status)
+
     result = await db.execute(stmt)
     reviews = result.scalars().all()
 
     return [_review_to_response(r) for r in reviews]
+
+
+@router.delete("/{review_id}", status_code=204)
+async def delete_review(
+    review_id: int,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Delete a review and all associated comments and logs."""
+    review = await db.get(Review, review_id)
+
+    if review is None:
+        raise HTTPException(status_code=404, detail="Review not found")
+
+    await db.delete(review)
+    await db.commit()
 
 
 @router.get("/{review_id}", response_model=ReviewDetailResponse)
