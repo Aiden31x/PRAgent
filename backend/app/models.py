@@ -110,6 +110,9 @@ class Review(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+    updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, onupdate=func.now()
+    )
 
     repo: Mapped["Repo"] = relationship(back_populates="reviews")
     comments: Mapped[list["ReviewComment"]] = relationship(
